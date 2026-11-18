@@ -57,11 +57,19 @@ pythonw "最终成果/WorkBuddy悬浮窗.pyw"
 pip install pyinstaller
 pyinstaller --noconfirm --clean --onefile --windowed \
   --name "WorkBuddy悬浮窗" \
-  --distpath "最终成果/dist" --workpath "_临时/build" \
+  --distpath "最终成果/dist" --workpath "build" \
   "最终成果/WorkBuddy悬浮窗.pyw"
 ```
 
-产物在 `最终成果/dist/` 目录，约 11 MB。也可直接用 `过程脚本/WorkBuddy悬浮窗.spec` 打包。
+产物在 `最终成果/dist/` 目录，约 11 MB。
+
+## 验证
+
+```bash
+python tests/verify_data_reader.py
+```
+
+6 个用例 / 15 项断言，覆盖增量追加、半行补完、子代理日志归属与双口径记账。全部在系统临时目录内造数据，不触碰你的真实日志；退出码 0 表示通过。改动 `data_reader.py` 的读取或记账逻辑后请重跑。
 
 ## 使用
 
@@ -129,6 +137,7 @@ pyinstaller --noconfirm --clean --onefile --windowed \
 workbuddy-hud/
 ├── README.md
 ├── LICENSE
+├── GLOSSARY.md                   # 领域术语表（口径、记账权、偏移…）
 ├── 最终成果/                     # 可交付成品，克隆后可直接运行
 │   ├── WorkBuddy悬浮窗.pyw       # 程序入口
 │   ├── data_reader.py            # 数据层：日志扫描与双口径统计
@@ -138,8 +147,10 @@ workbuddy-hud/
 │   ├── 使用说明.md               # 详细使用文档
 │   ├── docs/                     # 截图
 │   └── dist/                     # 打包产物（exe 与 设置.json，不入库）
-├── 过程脚本/                     # 开发期探查与验证脚本（不入库）
-├── 原始材料/                     # 外部输入材料（本项目无，见其说明）
+├── tests/                        # 回归用例（数据层口径与增量读取）
+├── docs/adr/                     # 架构决策记录
+├── 过程脚本/                     # 开发期探查脚本（仅作者本地，不入库）
+├── 原始材料/                     # 外部输入材料（本项目无，不入库）
 └── _临时/                        # 打包缓存、调试截图、历史版本（不入库）
 ```
 
