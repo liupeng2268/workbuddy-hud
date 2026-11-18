@@ -37,7 +37,7 @@
 
 ### 方式一：直接运行（推荐）
 
-从 [Releases](../../releases) 下载 `WorkBuddy悬浮窗.exe`，双击运行，无需安装 Python。
+从 [Releases](../../releases) 下载 `WorkBuddy-HUD.exe`，双击运行，无需安装 Python。
 
 ### 方式二：源码运行
 
