@@ -4,7 +4,7 @@
 
 一个常驻桌面的置顶小窗，实时显示 WorkBuddy（腾讯 AI 工作台）的**缓存命中率**与**生成速率**。数据完全来自本地会话日志，只读、不联网、不上传。
 
-![主界面](docs/main.png)
+![主界面](最终成果/docs/main.png)
 
 ---
 
@@ -23,7 +23,7 @@
 
 | 主界面 | 设置窗口 |
 |--------|----------|
-| ![主界面](docs/main.png) | ![设置](docs/settings.png) |
+| ![主界面](最终成果/docs/main.png) | ![设置](最终成果/docs/settings.png) |
 
 三行布局：
 
@@ -44,22 +44,24 @@
 ```bash
 git clone https://github.com/liupeng2268/workbuddy-hud.git
 cd workbuddy-hud
-pythonw WorkBuddy悬浮窗.pyw
+pythonw "最终成果/WorkBuddy悬浮窗.pyw"
 ```
 
 要求 Python 3.9+ 且包含 tkinter（Windows 官方安装包默认自带）。
 
-> 若双击 `.pyw` 无反应，说明系统 `.pyw` 文件关联缺失（Windows 上常见），改用 `启动.bat`，或按方式三自行打包。
+> 若双击 `.pyw` 无反应，说明系统 `.pyw` 文件关联缺失（Windows 上常见），改用 `最终成果/启动.bat`，或按方式三自行打包。
 
 ### 方式三：自行打包 exe
 
 ```bash
 pip install pyinstaller
 pyinstaller --noconfirm --clean --onefile --windowed \
-  --name "WorkBuddy悬浮窗" "WorkBuddy悬浮窗.pyw"
+  --name "WorkBuddy悬浮窗" \
+  --distpath "最终成果/dist" --workpath "_临时/build" \
+  "最终成果/WorkBuddy悬浮窗.pyw"
 ```
 
-产物在 `dist/` 目录，约 11 MB。
+产物在 `最终成果/dist/` 目录，约 11 MB。也可直接用 `过程脚本/WorkBuddy悬浮窗.spec` 打包。
 
 ## 使用
 
@@ -125,14 +127,23 @@ pyinstaller --noconfirm --clean --onefile --windowed \
 
 ```
 workbuddy-hud/
-├── WorkBuddy悬浮窗.pyw   # 程序入口
-├── data_reader.py        # 数据层：日志扫描与双口径统计
-├── floating_ui.py        # 界面层：悬浮窗与设置窗口
-├── 启动.bat              # 备用启动脚本
-├── 接口约定.md           # 两模块的接口契约
-├── 使用说明.md           # 详细使用文档
-└── docs/                 # 截图
+├── README.md
+├── LICENSE
+├── 最终成果/                     # 可交付成品，克隆后可直接运行
+│   ├── WorkBuddy悬浮窗.pyw       # 程序入口
+│   ├── data_reader.py            # 数据层：日志扫描与双口径统计
+│   ├── floating_ui.py            # 界面层：悬浮窗与设置窗口
+│   ├── 启动.bat                  # 备用启动脚本
+│   ├── 接口约定.md               # 两模块的接口契约
+│   ├── 使用说明.md               # 详细使用文档
+│   ├── docs/                     # 截图
+│   └── dist/                     # 打包产物（exe 与 设置.json，不入库）
+├── 过程脚本/                     # 开发期探查与验证脚本（不入库）
+├── 原始材料/                     # 外部输入材料（本项目无，见其说明）
+└── _临时/                        # 打包缓存、调试截图、历史版本（不入库）
 ```
+
+源码、`启动.bat`、`docs/`、`dist/` 在 `最终成果/` 内保持同级，因此三者之间的相对路径与程序内的 `BASE_DIR` 逻辑无需改动。
 
 ## 许可证
 
