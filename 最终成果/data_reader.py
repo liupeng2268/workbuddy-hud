@@ -238,7 +238,7 @@ class UsageReader:
                     break
                 try:
                     used = self._consume(
-                        path, size, budget, do_full, self._files, True
+                        path, size, budget, do_full, self._files, True, False
                     )
                 except OSError:
                     continue
@@ -316,24 +316,34 @@ class UsageReader:
 
     # -- 通用读取与解析 -----------------------------------------------------
 
-    def _consume(self, path, size, budget, full, files_map, to_session):
+    def _consume(self, path, size, budget, full, files_map, to_session,
+                 to_history=True):
         """读取单个文件的新增字节，返回本轮消耗的字节数。
 
         files_map 决定 offset 归属（会话表或历史表），因此同一文件可以被
-        两套统计各自读取一次，互不影响计数。
+        两套统计各自读取一次，互不影响计数。to_history 为 False 时本批数据
+        不计入历史口径（会话扫描只喂会话计数，历史计数只由历史扫描写入）。
+
+        state 里的 boundary 记录 offset 是否正好落在行首：True 表示下一批
+        可以直接解析，False 表示 offset 落在行中（只出现在新文件回溯读取）。
         """
         state = files_map.get(path)
         first = state is None
 
         if first:
             start = 0 if full else max(0, size - NEW_FILE_TAIL_BYTES)
+            boundary = start == 0      # 从 0 开始必为行首
         else:
             start = state["offset"]
+            boundary = state.get("boundary", True)   # 旧结构按行首处理
             if size < start:          # 文件被截断，从头重读
                 start = 0
+                boundary = True
 
         if size <= start:
-            files_map[path] = {"offset": start, "size": size}
+            files_map[path] = {
+                "offset": start, "size": size, "boundary": boundary
+            }
             return 0
 
         want = size - start
@@ -344,17 +354,21 @@ class UsageReader:
             handle.seek(start)
             data = handle.read(want)
         if not data:
-            files_map[path] = {"offset": start, "size": size}
+            files_map[path] = {
+                "offset": start, "size": size, "boundary": boundary
+            }
             return 0
 
         base = start
         payload = data
 
-        # 从文件中途开始读时，首行多半是半行，丢弃到第一个换行为止
-        if start > 0:
+        # 只有在 offset 不在行首时，首行才是半行，丢弃到第一个换行为止
+        if not boundary and start > 0:
             newline = payload.find(b"\n")
             if newline < 0:
-                files_map[path] = {"offset": start, "size": size}
+                files_map[path] = {
+                    "offset": start, "size": size, "boundary": boundary
+                }
                 return len(data)
             base = start + newline + 1
             payload = payload[newline + 1:]
@@ -362,18 +376,20 @@ class UsageReader:
         # 只处理完整行，尾部残行留到下次，避免半截 JSON 与重复计数
         last_newline = payload.rfind(b"\n")
         if last_newline < 0:
+            # 一条完整行都没有：offset 原地不动，等这条行写完整再解析
             files_map[path] = {
-                "offset": size if want >= size - start else start,
-                "size": size,
+                "offset": start, "size": size, "boundary": boundary
             }
             return len(data)
 
-        self._parse(payload[:last_newline + 1], to_session)
-        files_map[path] = {"offset": base + last_newline + 1, "size": size}
+        self._parse(payload[:last_newline + 1], to_session, to_history)
+        files_map[path] = {
+            "offset": base + last_newline + 1, "size": size, "boundary": True
+        }
         return want
 
-    def _parse(self, blob, to_session):
-        """解析一批完整行。历史口径总是累加，会话口径按标志累加。"""
+    def _parse(self, blob, to_session, to_history=True):
+        """解析一批完整行。会话口径按 to_session 累加，历史口径按 to_history 累加。"""
         keep_after = time.time() * 1000.0 - SPEED_KEEP_MS
         hit = miss = prompt = cached = out = records = 0
         samples = []
@@ -439,13 +455,14 @@ class UsageReader:
                 samples.append((ts, completion))
 
         with self._state_lock:
-            # 历史口径总是累加
-            self._h_hit += hit
-            self._h_miss += miss
-            self._h_prompt += prompt
-            self._h_cached += cached
-            self._h_out += out
-            self._h_records += records
+            # 历史口径只由历史扫描写入，避免会话扫描重复累加
+            if to_history:
+                self._h_hit += hit
+                self._h_miss += miss
+                self._h_prompt += prompt
+                self._h_cached += cached
+                self._h_out += out
+                self._h_records += records
 
             if to_session:
                 self._s_hit += hit
