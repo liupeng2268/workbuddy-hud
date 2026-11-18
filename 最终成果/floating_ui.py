@@ -12,6 +12,11 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 
+try:  # 版本号缺失时不影响界面启动
+    from version import __version__ as _APP_VERSION
+except Exception:      # pragma: no cover - 仅在单独拷贝本文件时触发
+    _APP_VERSION = "unknown"
+
 # ------------------------------------------------------------------ 配置存储
 def _base_dir():
     """打包成 exe 后 __file__ 指向临时目录，必须用 exe 自身所在目录。"""
@@ -451,7 +456,7 @@ class _FloatingWindow(object):
 
         win = tk.Toplevel(self.root)
         self._settings_win = win
-        win.title("悬浮窗设置")
+        win.title("悬浮窗设置 · v%s" % _APP_VERSION)
         win.configure(bg=BG)
         win.attributes("-topmost", True)
         win.resizable(False, False)
@@ -621,7 +626,7 @@ class _FloatingWindow(object):
     def _snapshot_text(self):
         snap = self._last or {}
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        lines = ["WorkBuddy 用量快照  " + stamp]
+        lines = ["WorkBuddy 用量快照 v%s  %s" % (_APP_VERSION, stamp)]
 
         if self._last_error:
             lines.append("状态: 数据读取异常")
@@ -673,7 +678,7 @@ def run_app(snapshot_provider, interval_ms=1000):
     interval_ms: 刷新间隔（毫秒）。
     """
     root = tk.Tk()
-    root.title("WorkBuddy 用量")
+    root.title("WorkBuddy 用量 v%s" % _APP_VERSION)
     _FloatingWindow(root, snapshot_provider, interval_ms)
     root.mainloop()
 

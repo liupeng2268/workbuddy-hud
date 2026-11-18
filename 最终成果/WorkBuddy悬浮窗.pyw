@@ -25,6 +25,8 @@ else:
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from version import __version__  # noqa: E402  （必须在 sys.path 处理之后）
+
 LOG_PATH = os.path.join(BASE_DIR, "运行日志.txt")
 
 
@@ -33,7 +35,7 @@ def _write_log(text: str) -> None:
     try:
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(f"[{stamp}] {text}\n")
+            fh.write(f"[{stamp}] v{__version__} {text}\n")
     except Exception:
         pass
 
