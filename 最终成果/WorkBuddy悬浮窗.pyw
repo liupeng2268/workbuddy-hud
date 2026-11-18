@@ -29,6 +29,36 @@ from version import __version__  # noqa: E402  （必须在 sys.path 处理之�
 
 LOG_PATH = os.path.join(BASE_DIR, "运行日志.txt")
 
+#: 单实例互斥体句柄，必须挂在模块级，否则会被回收、起不到互斥作用
+_MUTEX_HANDLE = None
+
+#: ERROR_ALREADY_EXISTS
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance() -> bool:
+    """保证只跑一个实例，避免重复扫描几百 MB 日志。
+
+    返回 False 表示已有实例在运行；非 Windows 或互斥体创建失败时一律放行。
+    """
+    global _MUTEX_HANDLE
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        _MUTEX_HANDLE = kernel32.CreateMutexW(
+            None, False, "WorkBuddyHUD_SingleInstance"
+        )
+        if not _MUTEX_HANDLE:
+            return True                      # 创建失败就不做拦截
+        if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+            return False
+    except Exception:
+        return True
+    return True
+
 
 def _write_log(text: str) -> None:
     """把异常写入同目录日志，因为 .pyw 没有控制台，不写日志就完全静默。"""
@@ -54,6 +84,9 @@ def _resolve_projects_dir() -> str:
 
 
 def main() -> None:
+    if not _acquire_single_instance():
+        sys.exit(0)
+
     projects_dir = _resolve_projects_dir()
 
     try:

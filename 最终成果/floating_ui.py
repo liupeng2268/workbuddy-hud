@@ -56,6 +56,9 @@ DEFAULT_CONFIG = {
     "line3": "session_out",
     "refresh_ms": 1000,
     "opacity": 1.0,
+    # 窗口上次位置；None 表示还没有记忆过，启动时回落到右下角
+    "x": None,
+    "y": None,
 }
 
 
@@ -88,6 +91,16 @@ def _load_config():
         cfg["opacity"] = DEFAULT_CONFIG["opacity"]
     if cfg["opacity"] not in OPACITY_OPTIONS:
         cfg["opacity"] = DEFAULT_CONFIG["opacity"]
+    # 旧版 设置.json 没有 x/y，缺失或非法时统一按“未记忆”处理
+    for axis in ("x", "y"):
+        value = cfg.get(axis)
+        if value is None or isinstance(value, bool):
+            cfg[axis] = None
+            continue
+        try:
+            cfg[axis] = int(value)
+        except (TypeError, ValueError):
+            cfg[axis] = None
     return cfg
 
 
@@ -114,6 +127,10 @@ HEIGHT = 116
 RADIUS = 14                      # 圆角半径
 MARGIN_RIGHT = 24                # 距屏幕右边缘
 MARGIN_BOTTOM = 80               # 距屏幕下边缘
+MIN_VISIBLE_W = 60               # 拖动时至少留在屏幕内的宽度
+MIN_VISIBLE_H = 40               # 拖动时至少留在屏幕内的高度
+HINT_TEXT = "右键设置 · 按住拖动"
+HINT_MS = 20000                  # 首次运行的提示停留时长
 
 BG = "#1e1f22"                   # 窗口底色
 BORDER = "#32353b"               # 1px 描边，避免深色背景在深色壁纸上糊成一片
@@ -260,6 +277,8 @@ class _FloatingWindow(object):
     def __init__(self, root, snapshot_provider, interval_ms):
         self.root = root
         self.provider = snapshot_provider
+        # 配置文件不存在即视为首次运行，用于显示“右键设置”的引导
+        self._first_run = not os.path.exists(CONFIG_PATH)
         self.cfg = _load_config()
         # 配置中的刷新间隔优先于构造参数，保证设置界面改完即生效
         try:
@@ -273,6 +292,8 @@ class _FloatingWindow(object):
         self._drag_dx = 0
         self._drag_dy = 0
         self._after_id = None
+        self._hint_after = None
+        self._hint_active = self._first_run
 
         self.family = _pick_font_family(root)
 
@@ -308,7 +329,7 @@ class _FloatingWindow(object):
         self._build_text_items()
         self._build_menu()
         self._bind_events()
-        self._place_bottom_right()
+        self._place_initial()
 
         # 先把窗口画出来再加载数据：首次全量扫描约 2.5 秒，若直接调用
         # _refresh()，用户会在这段时间里看不到任何窗口。update() 之后
@@ -321,6 +342,12 @@ class _FloatingWindow(object):
 
         self._refresh()
         self._schedule()
+        if self._hint_active:
+            try:
+                self._hint_after = self.root.after(HINT_MS, self._clear_hint)
+            except tk.TclError:
+                self._hint_after = None
+                self._hint_active = False
 
     # ---------------------------------------------------------- 静态绘制
     def _draw_background(self):
@@ -383,6 +410,7 @@ class _FloatingWindow(object):
         self.menu.add_command(label="刷新", command=self._refresh)
         self.menu.add_command(label="设置…", command=self._open_settings)
         self.menu.add_command(label="复制快照", command=self._copy_snapshot)
+        self.menu.add_command(label="打开程序目录", command=self._open_base_dir)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self.quit)
 
@@ -390,10 +418,58 @@ class _FloatingWindow(object):
         for widget in (self.canvas, self.root):
             widget.bind("<Button-1>", self._on_press)
             widget.bind("<B1-Motion>", self._on_drag)
+            widget.bind("<ButtonRelease-1>", self._on_release)
             widget.bind("<Button-3>", self._on_menu)
 
+    # ---------------------------------------------------------- 位置
+    def _screen_bounds(self):
+        """返回整个桌面矩形 (left, top, right, bottom)。
+
+        优先用虚拟桌面（覆盖所有显示器，可带负坐标），拿不到时退回主屏。
+        """
+        try:
+            left = int(self.root.winfo_vrootx())
+            top = int(self.root.winfo_vrooty())
+            width = int(self.root.winfo_vrootwidth())
+            height = int(self.root.winfo_vrootheight())
+        except (tk.TclError, ValueError):
+            left = top = 0
+            width, height = 0, 0
+        if width <= 0 or height <= 0:
+            left, top = 0, 0
+            width = int(self.root.winfo_screenwidth())
+            height = int(self.root.winfo_screenheight())
+        if width <= 0 or height <= 0:
+            # 极端情况下拿不到屏幕尺寸，给一个保守的默认值避免除零/死循环
+            width, height = 1024, 768
+        return left, top, left + width, top + height
+
+    def _clamp_position(self, x, y):
+        """把窗口坐标钳到「至少 MIN_VISIBLE_W x MIN_VISIBLE_H 可见」。"""
+        left, top, right, bottom = self._screen_bounds()
+        min_x = left - WIDTH + MIN_VISIBLE_W
+        max_x = right - MIN_VISIBLE_W
+        min_y = top - HEIGHT + MIN_VISIBLE_H
+        max_y = bottom - MIN_VISIBLE_H
+        x = min(max(int(x), min_x), max_x)
+        y = min(max(int(y), min_y), max_y)
+        return x, y
+
+    def _place_initial(self):
+        """优先用上次记住的位置，与桌面无交集时回落到右下角。"""
+        x = self.cfg.get("x")
+        y = self.cfg.get("y")
+        if x is not None and y is not None and self._intersects_screen(x, y):
+            self.root.geometry("{}x{}+{}+{}".format(WIDTH, HEIGHT, int(x), int(y)))
+            return
+        self._place_bottom_right()
+
+    def _intersects_screen(self, x, y):
+        """窗口与桌面矩形是否有交集（负坐标合法，多显示器也成立）。"""
+        left, top, right, bottom = self._screen_bounds()
+        return x + WIDTH > left and y + HEIGHT > top and x < right and y < bottom
+
     def _place_bottom_right(self):
-        self.root.update_idletasks()
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         x = max(0, screen_w - WIDTH - MARGIN_RIGHT)
@@ -414,9 +490,26 @@ class _FloatingWindow(object):
     def _on_drag(self, event):
         if not self._alive:
             return
-        x = event.x_root - self._drag_dx
-        y = event.y_root - self._drag_dy
+        x, y = self._clamp_position(
+            event.x_root - self._drag_dx,
+            event.y_root - self._drag_dy,
+        )
         self.root.geometry("+{}+{}".format(x, y))
+
+    def _on_release(self, event):
+        """松开鼠标后记住位置；写盘失败不影响拖动，故忽略返回值。"""
+        if not self._alive:
+            return
+        try:
+            x = int(self.root.winfo_x())
+            y = int(self.root.winfo_y())
+        except (tk.TclError, ValueError):
+            return
+        if self.cfg.get("x") == x and self.cfg.get("y") == y:
+            return
+        self.cfg["x"] = x
+        self.cfg["y"] = y
+        _save_config(self.cfg)
 
     # ---------------------------------------------------------- 右键菜单
     def _on_menu(self, event):
@@ -514,6 +607,9 @@ class _FloatingWindow(object):
             except tk.TclError:
                 pass
 
+        # 保存失败时在窗口底部提示，不关窗，让用户知道设置没有落盘
+        msg_var = tk.StringVar(value="")
+
         def do_save():
             for key, (var, options) in variables.items():
                 chosen = var.get()
@@ -526,7 +622,10 @@ class _FloatingWindow(object):
                         else:
                             self.cfg[key] = opt_key
                         break
-            _save_config(self.cfg)
+            if not _save_config(self.cfg):
+                msg_var.set("保存失败：程序目录不可写，本次设置仅本次有效")
+                self._apply_config()
+                return
             self._apply_config()
             close()
 
@@ -542,11 +641,38 @@ class _FloatingWindow(object):
             )
 
         bar = tk.Frame(win, bg=BG)
-        bar.grid(row=len(rows) + 1, column=0, columnspan=2, pady=(16, 14))
+        bar.grid(row=len(rows) + 1, column=0, columnspan=2, pady=(16, 6))
         button(bar, "保存", do_save, primary=True).pack(side="right", padx=(8, 0))
         button(bar, "取消", close).pack(side="right")
 
+        tk.Label(
+            win,
+            textvariable=msg_var,
+            bg=BG,
+            fg=ACCENT_LOW,
+            font=(self.family, 9),
+            wraplength=320,
+            justify="left",
+        ).grid(row=len(rows) + 2, column=0, columnspan=2, padx=16, pady=(0, 12))
+
         win.protocol("WM_DELETE_WINDOW", close)
+
+        # 键盘路径：Esc 取消，Enter 保存（主窗口无焦点，不绑全局键）
+        def on_escape(_event):
+            close()
+            return "break"
+
+        def on_return(_event):
+            do_save()
+            return "break"
+
+        win.bind("<Escape>", on_escape)
+        win.bind("<Return>", on_return)
+        win.bind("<KP_Enter>", on_return)
+        try:
+            win.focus_force()
+        except tk.TclError:
+            pass
 
     # ---------------------------------------------------------- 数据刷新
     def _schedule(self):
@@ -591,36 +717,59 @@ class _FloatingWindow(object):
 
     def _render(self, snapshot, error):
         if error:
-            message = _clip(error, 28) or "数据读取异常"
+            message = _clip(error, 40) or "数据读取异常"
             self.canvas.itemconfigure(self.item_rate, text="数据读取异常", fill=ACCENT_LOW)
             self.canvas.itemconfigure(self.item_speed, text="命中率 -- · 速率 --", fill=MUTED)
             self.canvas.itemconfigure(self.item_total, text=message, fill=MUTED)
             return
 
         # 第一行：按设置选用会话口径或历史口径
-        if self.cfg.get("hit_rate_scope") == "history":
+        scope = self.cfg.get("hit_rate_scope")
+        if scope == "history":
             rate = snapshot.get("history_hit_rate")
             prefix = "全历史 "
         else:
             rate = snapshot.get("hit_rate")
             prefix = "命中率 "
 
-        self.canvas.itemconfigure(
-            self.item_rate,
-            text=prefix + _fmt_percent(rate),
-            fill=_accent_for(rate),
-        )
+        # 数据层可能暂时还没提供 speed_idle，用 .get 兜底，缺省视为“还没算出来”
+        records = _as_int(snapshot.get("records"))
+        idle = bool(snapshot.get("speed_idle"))
+        if scope != "history" and records == 0 and not idle:
+            # 首轮扫描尚未出数据，先给出状态而不是干巴巴的 "--"
+            self.canvas.itemconfigure(
+                self.item_rate, text="正在扫描…", fill=MUTED
+            )
+        else:
+            self.canvas.itemconfigure(
+                self.item_rate,
+                text=prefix + _fmt_percent(rate),
+                fill=_accent_for(rate),
+            )
+
+        speed = snapshot.get("speed")
+        speed_text = "空闲" if (speed is None and idle) else _fmt_speed(speed)
         self.canvas.itemconfigure(
             self.item_speed,
-            text=_fmt_speed(snapshot.get("speed")),
+            text=speed_text,
             fill=FG,
         )
+        # 第三行：首次运行先显示操作引导，到时自动恢复真实指标
+        if self._hint_active:
+            self.canvas.itemconfigure(self.item_total, text=HINT_TEXT, fill=MUTED)
+            return
         # 第三行：按设置切换指标
         self.canvas.itemconfigure(
             self.item_total,
             text=_line3_text(self.cfg.get("line3", "session_out"), snapshot),
             fill=MUTED,
         )
+
+    def _clear_hint(self):
+        """首次运行提示到期，恢复第三行的真实指标。"""
+        self._hint_after = None
+        self._hint_active = False
+        self._render(self._last, self._last_error)
 
     # ---------------------------------------------------------- 复制与退出
     def _snapshot_text(self):
@@ -656,6 +805,13 @@ class _FloatingWindow(object):
         except tk.TclError:
             pass
 
+    def _open_base_dir(self):
+        """打开程序所在目录（设置.json / 运行日志.txt 都在这里）。"""
+        try:
+            os.startfile(_base_dir())
+        except Exception:
+            pass
+
     def quit(self):
         self._alive = False
         if self._after_id is not None:
@@ -664,6 +820,12 @@ class _FloatingWindow(object):
             except tk.TclError:
                 pass
             self._after_id = None
+        if self._hint_after is not None:
+            try:
+                self.root.after_cancel(self._hint_after)
+            except tk.TclError:
+                pass
+            self._hint_after = None
         try:
             self.root.destroy()
         except tk.TclError:

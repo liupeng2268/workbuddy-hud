@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """UsageReader 的回归验收脚本（纯标准库，无需 pytest）。
 
-覆盖：基线口径、增量追加、半行补完、subagents 计入、历史不重复。
+覆盖：基线口径、增量追加、半行补完、subagents 计入、历史不重复、
+截断重写不二次计数、运行期新增文件的历史口径、速率空闲归零。
 全部用例只在 tempfile 临时目录里造数据，绝不读写用户真实日志。
 
 用法（在仓库根目录执行）：
@@ -26,6 +27,7 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 try:
+    import data_reader
     from data_reader import UsageReader
 except Exception as _exc:  # 导入失败也要给出明确结论
     print("[FAIL] 无法导入 data_reader.UsageReader（%s 起）：%s: %s"
@@ -136,6 +138,22 @@ def _files_of(snap):
     if "files" in snap:
         return snap.get("files")
     return snap.get("file_count")
+
+
+def _patch_const(name, value):
+    """临时改写 data_reader 的模块级常量，返回原值现场供 _restore_const 还原。"""
+    saved = (hasattr(data_reader, name), getattr(data_reader, name, None))
+    setattr(data_reader, name, value)
+    return saved
+
+
+def _restore_const(name, saved):
+    """还原 _patch_const 的现场；原本不存在的常量直接删除。"""
+    had, old = saved
+    if had:
+        setattr(data_reader, name, old)
+    elif hasattr(data_reader, name):
+        delattr(data_reader, name)
 
 
 # ---- 用例 1~3：基线 + 追加 1 条 + 追加 2 条 --------------------------------
@@ -281,6 +299,136 @@ def case_history_no_duplicate():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# ---- 用例 7：文件被截断后重写，不得二次计数 --------------------------------
+
+def case_truncate_rewrite():
+    case = "7"
+    root, proj = _mk_case_dir()
+    try:
+        main = os.path.join(proj, "sess-t.jsonl")
+        _append_records(main, 10)
+
+        reader = UsageReader(root)
+        snap = _wait_history(reader)
+        _record(case, "截断前基线 records==10", snap.get("records"), 10)
+        _record(case, "截断前基线 history_records==10",
+                snap.get("history_records"), 10)
+
+        # 清空重写 3 条：size 变小，程序应按截断处理并重算，而不是累加
+        stamps = _stamps(3)
+        with open(main, "wb") as handle:
+            handle.write("".join(_line(ts) for ts in stamps).encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        snap = _wait(reader, lambda s: s.get("records") == 3, 8.0)
+        _record(case, "截断重写后 records==3（修复前会是 13）",
+                snap.get("records"), 3)
+
+        snap = _wait(
+            reader, lambda s: s.get("history_records") == 3, 15.0
+        )
+        _record(case, "截断重写后 history_records==3（修复前会是 13）",
+                snap.get("history_records"), 3)
+        _record_true(case, "截断重写场景 error 为空", snap.get("error") is None,
+                     snap.get("error"))
+    except Exception as exc:
+        _record_true(case, "用例未抛异常", False, "%s: %s"
+                     % (type(exc).__name__, exc))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---- 用例 8：运行期新增的大文件，历史口径要读头部 --------------------------
+
+def case_new_big_file_history():
+    case = "8"
+    root, proj = _mk_case_dir()
+    saved_tail = None
+    try:
+        main = os.path.join(proj, "cur.jsonl")
+        _append_records(main, 1)
+
+        reader = UsageReader(root)
+        snap = _wait_history(reader)
+        _record(case, "占位主日志 records==1", snap.get("records"), 1)
+        _record(case, "占位主日志 history_records==1",
+                snap.get("history_records"), 1)
+
+        # 把「新文件只读尾部」的预算压到 1KB，让截断行为在 2000 条上可见
+        saved_tail = _patch_const("NEW_FILE_TAIL_BYTES", 1024)
+
+        # 大文件先写在扫描目录之外，落盘、改旧 mtime 后再搬进来，
+        # 避免「刚创建时 mtime 最新」的瞬间抢走当前会话
+        staging = os.path.join(root, "staging")
+        os.makedirs(staging)
+        staged = os.path.join(staging, "old-big.jsonl")
+        _append_records(staged, 2000)
+        old = time.time() - 3600
+        os.utime(staged, (old, old))
+        os.replace(staged, os.path.join(proj, "old-big.jsonl"))
+
+        snap = _wait(
+            reader, lambda s: s.get("history_records") == 2001, 25.0
+        )
+        _record(case, "历史口径读全新增大文件：history_records==2001"
+                "（修复前只算尾部几条）", snap.get("history_records"), 2001)
+        _record(case, "旧 mtime 大文件未抢走当前会话：records==1",
+                snap.get("records"), 1)
+        _record_true(case, "新增大文件场景 error 为空",
+                     snap.get("error") is None, snap.get("error"))
+    except Exception as exc:
+        _record_true(case, "用例未抛异常", False, "%s: %s"
+                     % (type(exc).__name__, exc))
+    finally:
+        if saved_tail is not None:
+            _restore_const("NEW_FILE_TAIL_BYTES", saved_tail)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---- 用例 9：停止生成后速率归零，单条样本要给出数值 ------------------------
+
+def case_speed_single_sample_and_idle():
+    case = "9"
+    root, proj = _mk_case_dir()
+    saved_idle = None
+    try:
+        main = os.path.join(proj, "sess-v.jsonl")
+        _append_records(main, 1)
+
+        reader = UsageReader(root)
+        snap = _wait(reader, lambda s: (s.get("records") or 0) >= 1, 8.0)
+        _record(case, "速率用例基线 records==1", snap.get("records"), 1)
+
+        speed = snap.get("speed")
+        _record_true(
+            case, "单条样本 speed 为数值且 > 0（修复前为 None）",
+            isinstance(speed, (int, float))
+            and not isinstance(speed, bool)
+            and speed > 0,
+            "speed=%r" % (speed,),
+        )
+
+        # 空闲阈值压到 300ms，1 秒后就必然超时
+        saved_idle = _patch_const("SPEED_IDLE_MS", 300)
+        time.sleep(1.2)
+        snap = reader.snapshot()
+        _record_true(case, "空闲超时后 speed 为 None（不残留旧速率）",
+                     snap.get("speed") is None, "speed=%r" % (snap.get("speed"),))
+        _record_true(case, "空闲超时后 speed_idle 为 True",
+                     snap.get("speed_idle") is True,
+                     "speed_idle=%r" % (snap.get("speed_idle"),))
+        _record_true(case, "速率用例 error 为空", snap.get("error") is None,
+                     snap.get("error"))
+    except Exception as exc:
+        _record_true(case, "用例未抛异常", False, "%s: %s"
+                     % (type(exc).__name__, exc))
+    finally:
+        if saved_idle is not None:
+            _restore_const("SPEED_IDLE_MS", saved_idle)
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # ---- 主流程 ---------------------------------------------------------------
 
 def main():
@@ -293,6 +441,9 @@ def main():
     case_half_line()
     case_subagents()
     case_history_no_duplicate()
+    case_truncate_rewrite()
+    case_new_big_file_history()
+    case_speed_single_sample_and_idle()
 
     print("-" * 68)
     failed = [item for item in _RESULTS if not item[2]]
