@@ -429,6 +429,61 @@ def case_speed_single_sample_and_idle():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# ---- 用例 10：多会话模式（10 分钟活跃窗口 + 最多 3 行） -------------------
+
+def case_multi_session():
+    case = "10"
+    root, proj = _mk_case_dir()
+    try:
+        now = time.time()
+        layout = [("s-new", 4, 0), ("s-mid", 3, 120),
+                  ("s-old", 2, 1800), ("s-far", 5, 2400)]
+        for name, count, age in layout:
+            path = os.path.join(proj, name + ".jsonl")
+            _append_records(path, count)
+            os.utime(path, (now - age, now - age))
+
+        reader = UsageReader(root)
+        reader.set_multi(True)
+        snap = _wait(reader, lambda s: (s.get("session_count") or 0) >= 2, 10.0)
+        time.sleep(1.0)
+        snap = reader.snapshot()
+
+        rows = snap.get("sessions") or []
+        _record(case, "10 分钟内活跃会话数==2", snap.get("session_count"), 2)
+        _record(case, "多会话行数==2", len(rows), 2)
+        _record(case, "按最近写入倒序",
+                [row["session_id"] for row in rows], ["s-new", "s-mid"])
+        _record(case, "最新会话 records==4", snap.get("records"), 4)
+        _record(case, "10 分钟外的会话不出现在列表",
+                any(row["session_id"] in ("s-old", "s-far") for row in rows),
+                False)
+
+        # 再补 3 个活跃会话，总数 5，列表最多 3 行
+        for index in range(3):
+            path = os.path.join(proj, "s-extra%d.jsonl" % index)
+            _append_records(path, 1)
+        snap = _wait(reader, lambda s: (s.get("session_count") or 0) >= 5, 10.0)
+        _record(case, "活跃总数==5", snap.get("session_count"), 5)
+        _record(case, "列表最多 3 行（多出的靠 session_count 提示）",
+                len(snap.get("sessions") or []), 3)
+
+        # 切回单会话：只保留最新一个
+        reader.set_multi(False)
+        snap = _wait(reader, lambda s: s.get("session_count") == 1, 8.0)
+        _record(case, "切回单会话 session_count==1",
+                snap.get("session_count"), 1)
+        _record(case, "切回单会话列表只有 1 行",
+                len(snap.get("sessions") or []), 1)
+        _record_true(case, "多会话场景 error 为空",
+                     snap.get("error") is None, snap.get("error"))
+    except Exception as exc:
+        _record_true(case, "用例未抛异常", False, "%s: %s"
+                     % (type(exc).__name__, exc))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # ---- 主流程 ---------------------------------------------------------------
 
 def main():
@@ -444,6 +499,7 @@ def main():
     case_truncate_rewrite()
     case_new_big_file_history()
     case_speed_single_sample_and_idle()
+    case_multi_session()
 
     print("-" * 68)
     failed = [item for item in _RESULTS if not item[2]]

@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
-"""WorkBuddy 悬浮窗 —— 数据层（双口径版）。
+"""WorkBuddy 悬浮窗 —— 数据层（双口径 + 多会话版）。
 
 只读扫描 ``~/.workbuddy/projects`` 下的 ``*.jsonl`` 会话日志，同时维护两套
 互相独立的统计：
 
-  * **会话口径**：当前活跃会话（mtime 最新的主日志 + 其 subagents）
+  * **会话口径**：一个或多个当前活跃会话（主日志 + 其 subagents）
   * **历史口径**：全部日志的全历史累计
+
+会话口径默认只统计 mtime 最新的一个会话（单会话模式）；开启多会话模式后，
+统计最近 ``ACTIVE_WINDOW_SEC`` 秒内有过写入的全部会话，最多保留
+``MAX_SESSIONS`` 个，按最后写入时间倒序。每个会话有独立的偏移表与计数器，
+互不干扰。
 
 理由：会话口径反映「这次对话的缓存效率」，数值会明显波动；历史口径反映
 「长期平均值」，稳定在 96% 上下。两者各有用途，由界面按用户设置选用。
@@ -13,8 +18,7 @@
 加载策略：
   * 会话口径首次全量（通常 <1 秒），之后按 (size, offset) 增量
   * 历史口径首次全量（324 文件 / 354 MB 约 2~3 秒），之后每 4 个周期增量一次
-  * 两套统计各有独立的 offset 表，互不干扰
-  * 会话切换时只重建会话口径，历史口径保持连续
+  * 各统计各有独立的 offset 表，互不干扰
 
 任何异常都写入 error 字段，绝不向调用方抛出。
 """
@@ -42,6 +46,12 @@ HISTORY_MAX_BYTES = 16 * 1024 * 1024
 #: 会话口径增量阶段新出现的文件，最多回溯读取末尾这么多字节
 #: （历史口径的新文件不受此限制，一律从 0 读，见 _consume 的注释）
 NEW_FILE_TAIL_BYTES = 4 * 1024 * 1024
+
+#: 多会话模式下，日志在这么多秒内有写入才算「同时进行」
+ACTIVE_WINDOW_SEC = 10 * 60
+
+#: 多会话模式最多统计的会话数（界面按此上限显示，每会话两行）
+MAX_SESSIONS = 3
 
 #: 速率的滑动窗口（毫秒）
 SPEED_WINDOW_MS = 60 * 1000
@@ -123,6 +133,111 @@ def _detail_of(state):
     return {field: _to_int(state.get(field)) for field in _DETAIL_FIELDS}
 
 
+class _SessionStats(object):
+    """单个会话的独立统计与文件偏移表。
+
+    所有方法都由 UsageReader 在持有 _state_lock 时调用，因此内部不再加锁。
+    """
+
+    def __init__(self, main_path):
+        self.main_path = main_path
+        self.session_id = os.path.splitext(os.path.basename(main_path))[0]
+        self.project = os.path.basename(os.path.dirname(main_path))
+        self.files = {}             # 本会话文件 -> {"offset", "size", ...}
+        self.hit = 0
+        self.miss = 0
+        self.prompt = 0
+        self.cached = 0
+        self.out = 0
+        self.records = 0
+        self.min_ts = 0             # 会话内最早记录时间（毫秒）
+        self.max_ts = 0             # 会话内最新记录时间（毫秒）
+        self.last_prompt = 0        # 最新一条请求的 prompt_tokens
+        self.model = ""             # 当前会话模型
+        self.title = ""             # 日志里 ai-title 给出的会话标题
+        self.title_ts = 0
+        self.last_mtime = 0.0       # 最近一次扫描到的文件写入时间（秒）
+        self.samples = deque()      # (timestamp_ms, completion_tokens)
+
+    def apply(self, batch):
+        """把一批解析结果累加到本会话。"""
+        self.hit += batch["hit"]
+        self.miss += batch["miss"]
+        self.prompt += batch["prompt"]
+        self.cached += batch["cached"]
+        self.out += batch["out"]
+        self.records += batch["records"]
+
+        min_ts = batch["min_ts"]
+        max_ts = batch["max_ts"]
+        if min_ts and (self.min_ts == 0 or min_ts < self.min_ts):
+            self.min_ts = min_ts
+        if max_ts > self.max_ts:
+            self.max_ts = max_ts
+            self.last_prompt = batch["last_prompt"]
+        if batch["model"]:
+            self.model = batch["model"]
+        if batch["title"] and batch["title_ts"] >= self.title_ts:
+            self.title = batch["title"]
+            self.title_ts = batch["title_ts"]
+        if batch["samples"]:
+            self.samples.extend(batch["samples"])
+
+    def rollback(self, detail):
+        """文件被截断重读前，把本文件此前的明细扣回。"""
+        self.hit = max(0, self.hit - detail["hit"])
+        self.miss = max(0, self.miss - detail["miss"])
+        self.prompt = max(0, self.prompt - detail["prompt"])
+        self.cached = max(0, self.cached - detail["cached"])
+        self.out = max(0, self.out - detail["out"])
+        self.records = max(0, self.records - detail["records"])
+
+    def row(self, now, now_ms, cutoff, keep):
+        """生成该会话的指标行（纯内存，调用方持锁）。"""
+        while self.samples and self.samples[0][0] < keep:
+            self.samples.popleft()
+
+        window = [s for s in self.samples if s[0] >= cutoff]
+        speed = None
+        speed_idle = False
+        if window:
+            newest = max(s[0] for s in window)
+            if now_ms - newest > SPEED_IDLE_MS:
+                speed_idle = True
+            else:
+                span = max(1.0, (now_ms - min(s[0] for s in window)) / 1000.0)
+                speed = sum(s[1] for s in window) / span
+                if speed < 0.0:
+                    speed = None
+
+        duration = 0.0
+        if self.min_ts and self.max_ts > self.min_ts:
+            duration = (self.max_ts - self.min_ts) / 1000.0
+
+        title = self.title or "%s · %s" % (
+            self.project or "会话", self.session_id[:6]
+        )
+        return {
+            "title": title,
+            "project": self.project,
+            "session_id": self.session_id,
+            "hit_rate": _ratio(
+                self.hit, self.miss, self.prompt, self.cached
+            ),
+            "speed": speed,
+            "speed_idle": speed_idle,
+            "total_out": self.out,
+            "records": self.records,
+            "hit_tokens": self.hit,
+            "miss_tokens": self.miss,
+            "context_tokens": self.last_prompt,
+            "session_duration": duration,
+            "model": self.model,
+            "last_active": self.max_ts / 1000.0 if self.max_ts else 0.0,
+            "updated_at": now,
+        }
+
+
 class UsageReader:
     """读取 WorkBuddy 会话日志，同时输出会话与历史两套指标。"""
 
@@ -133,20 +248,12 @@ class UsageReader:
         self._scan_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
-        # ---- 会话口径 ----
-        self._files = {}              # 会话相关文件 -> {"offset", "size"}
-        self._current_session = None  # 当前会话主日志绝对路径
-        self._s_hit = 0
-        self._s_miss = 0
-        self._s_prompt = 0
-        self._s_cached = 0
-        self._s_out = 0
-        self._s_records = 0
-        self._s_min_ts = 0            # 会话内最早记录时间（毫秒）
-        self._s_max_ts = 0            # 会话内最新记录时间（毫秒）
-        self._s_last_prompt = 0       # 最新一条请求的 prompt_tokens
-        self._s_model = ""            # 当前会话模型
-        self._samples = deque()       # (timestamp_ms, completion_tokens)
+        # ---- 会话口径（按会话独立统计）----
+        self._sessions = {}           # 主日志绝对路径 -> _SessionStats
+        self._primary = None          # 最新活跃会话主日志
+        self._session_total = 0       # 活跃会话总数（可能大于 MAX_SESSIONS）
+        self._multi = False           # 多会话模式开关
+        self._mode_dirty = False      # 模式刚切换，下一轮强制全量
 
         # ---- 历史口径 ----
         self._h_files = {}
@@ -172,6 +279,18 @@ class UsageReader:
 
     # -- 对外接口 -----------------------------------------------------------
 
+    def set_multi(self, enabled):
+        """切换单会话 / 多会话模式；下一轮扫描会自动做一次全量。
+
+        只碰 _state_lock，不等待正在进行的磁盘扫描，避免设置保存时界面卡住。
+        """
+        enabled = bool(enabled)
+        with self._state_lock:
+            if enabled == self._multi:
+                return
+            self._multi = enabled
+            self._mode_dirty = True
+
     def snapshot(self):
         """返回指标快照 dict。任何异常都被吞掉并写入 error 字段。"""
         if not self._primed.is_set():
@@ -186,7 +305,7 @@ class UsageReader:
     # -- 后台调度 -----------------------------------------------------------
 
     def _run(self):
-        # 1) 会话口径首次全量：只读当前会话，通常 1 秒内完成
+        # 1) 会话口径首次全量：只读活跃会话，通常 1 秒内完成
         try:
             self._scan_session(full=True)
         except Exception as exc:
@@ -228,36 +347,75 @@ class UsageReader:
             raise IOError("日志目录不存在: %s" % root)
 
         entries = self._collect(root)
-        current, related = self._pick_current_session(entries)
-        related.sort(key=lambda item: item[0], reverse=True)
 
         with self._scan_lock:
-            switched = current != self._current_session
-            if switched:
-                self._current_session = current
-                self._reset_session()
-            do_full = switched or full
-
+            do_full = full
             with self._state_lock:
-                self._file_count = len(related)
-                self._active_file = os.path.basename(current) if current else ""
+                multi = self._multi
+                if self._mode_dirty:
+                    do_full = True
+                    self._mode_dirty = False
 
-            alive = set(item[1] for item in related)
-            for path in [p for p in self._files if p not in alive]:
-                del self._files[path]
+            groups = self._group_sessions(entries)
+            if multi:
+                now = time.time()
+                active = [
+                    g for g in groups
+                    if 0 <= now - g["mtime"] <= ACTIVE_WINDOW_SEC
+                ]
+                total = len(active)
+                chosen = active[:MAX_SESSIONS]
+            else:
+                chosen = groups[:1]
+                total = len(chosen)
+
+            desired = dict((g["main"], g) for g in chosen)
+            with self._state_lock:
+                for key in [k for k in self._sessions if k not in desired]:
+                    del self._sessions[key]
+                for key, group in desired.items():
+                    stats = self._sessions.get(key)
+                    if stats is None:
+                        # 新出现的会话必须从头读，保证累计口径完整
+                        stats = _SessionStats(key)
+                        self._sessions[key] = stats
+                        do_full = True
+                    stats.project = group["project"]
+                    stats.last_mtime = group["mtime"]
+                    group["stats"] = stats
+                self._session_total = total
+                self._file_count = sum(len(g["files"]) for g in chosen)
+                self._primary = chosen[0]["main"] if chosen else None
+                self._active_file = (
+                    os.path.basename(self._primary) if self._primary else ""
+                )
+
+            # 文件消失时同步清理该会话的偏移表
+            for group in chosen:
+                keep = set(item[1] for item in group["files"])
+                stats = group["stats"]
+                for path in [p for p in stats.files if p not in keep]:
+                    del stats.files[path]
 
             budget = None if do_full else SESSION_MAX_BYTES
             deadline = (
                 None if do_full else time.perf_counter() + SESSION_TIME_BUDGET
             )
-            for _mtime, path, size in related:
+            # 跨会话按文件写入时间倒序消费，预算优先给最活跃的日志
+            tasks = []
+            for group in chosen:
+                for item in group["files"]:
+                    tasks.append((item[0], item[1], item[2], group["stats"]))
+            tasks.sort(key=lambda task: task[0], reverse=True)
+
+            for _mtime, path, size, stats in tasks:
                 if deadline is not None and time.perf_counter() >= deadline:
                     break
                 if budget is not None and budget <= 0:
                     break
                 try:
                     used = self._consume(
-                        path, size, budget, do_full, self._files, True, False
+                        path, size, budget, do_full, stats.files, stats, False
                     )
                 except OSError:
                     continue
@@ -267,38 +425,33 @@ class UsageReader:
         with self._state_lock:
             self._error = None
 
-    def _reset_session(self):
-        """会话切换时清零会话口径，历史口径保持不变。"""
-        with self._state_lock:
-            self._s_hit = 0
-            self._s_miss = 0
-            self._s_prompt = 0
-            self._s_cached = 0
-            self._s_out = 0
-            self._s_records = 0
-            self._s_min_ts = 0
-            self._s_max_ts = 0
-            self._s_last_prompt = 0
-            self._s_model = ""
-            self._samples.clear()
-        self._files.clear()
-
     @staticmethod
-    def _pick_current_session(entries):
-        """挑出当前活跃会话：mtime 最新的主日志 + 它名下的 subagents。"""
+    def _group_sessions(entries):
+        """把 (mtime, path, size) 列表按会话归组，并按写入时间倒序返回。"""
         marker = os.sep + "subagents" + os.sep
-        mains = [item for item in entries if marker not in item[1]]
-        if not mains:
-            return None, []
-        mains.sort(key=lambda item: item[0], reverse=True)
-        current = mains[0][1]
-        session_dir = os.path.splitext(current)[0]
-        sub_prefix = os.path.join(session_dir, "subagents") + os.sep
-        related = [
-            item for item in entries
-            if item[1] == current or item[1].startswith(sub_prefix)
-        ]
-        return current, related
+        groups = {}
+        for mtime, path, size in entries:
+            if marker in path:
+                # 子代理日志归属到 <会话目录>.jsonl 这个主日志
+                main = path.split(marker, 1)[0] + ".jsonl"
+            else:
+                main = path
+            group = groups.get(main)
+            if group is None:
+                group = {
+                    "main": main,
+                    "mtime": mtime,
+                    "project": os.path.basename(os.path.dirname(main)),
+                    "files": [],
+                }
+                groups[main] = group
+            group["files"].append((mtime, path, size))
+            if mtime > group["mtime"]:
+                group["mtime"] = mtime
+
+        result = list(groups.values())
+        result.sort(key=lambda item: item["mtime"], reverse=True)
+        return result
 
     # -- 历史口径扫描 -------------------------------------------------------
 
@@ -326,7 +479,7 @@ class UsageReader:
                     break
                 try:
                     used = self._consume(
-                        path, size, budget, full, self._h_files, False
+                        path, size, budget, full, self._h_files, None, True
                     )
                 except OSError:
                     continue
@@ -335,17 +488,18 @@ class UsageReader:
 
     # -- 通用读取与解析 -----------------------------------------------------
 
-    def _consume(self, path, size, budget, full, files_map, to_session,
-                 to_history=True):
+    def _consume(self, path, size, budget, full, files_map, stats,
+                 to_history):
         """读取单个文件的新增字节，返回本轮消耗的字节数。
 
-        files_map 决定 offset 与明细的归属（会话表或历史表），因此同一文件
-        可以被两套统计各自读取一次，互不影响计数。to_history 为 False 时本批
-        数据不计入历史口径（会话扫描只喂会话计数，历史计数只由历史扫描写入）。
+        files_map 决定 offset 与明细的归属（某个会话或历史表），因此同一文件
+        可以被多套统计各自读取一次，互不影响计数。stats 为 None 时本批数据
+        只计入历史口径；to_history 为 False 时不计入历史口径（会话扫描只喂
+        会话计数，历史计数只由历史扫描写入）。
 
         state 里除 offset/size/boundary 外，还按文件累计该文件自被统计以来的
         明细（hit/miss/prompt/cached/out/records）。文件被截断或重写时，先把
-        这份明细从全局计数器里扣回去再从头读，重读才不会把旧数据算两遍。
+        这份明细从计数器里扣回去再从头读，重读才不会把旧数据算两遍。
 
         boundary 记录 offset 是否正好落在行首：True 表示下一批可以直接解析，
         False 表示 offset 落在行中（只出现在会话口径的新文件尾部回溯）。
@@ -372,7 +526,7 @@ class UsageReader:
                 # 先把本文件此前计入的明细扣回去，再从头重读。会话口径的
                 # min_ts/max_ts/last_prompt/model 与采样队列无法按文件回滚，
                 # 只有计数类指标回滚，速率曲线可能短暂失真（可接受）。
-                self._rollback(detail, to_session, to_history)
+                self._rollback(detail, stats, to_history)
                 detail = _empty_detail()
                 start = 0
                 boundary = True
@@ -411,11 +565,13 @@ class UsageReader:
             self._store(files_map, path, start, size, boundary, detail)
             return len(data)
 
-        batch = self._parse(payload[:last_newline + 1], to_session, to_history)
+        batch = self._parse(
+            payload[:last_newline + 1], stats is not None
+        )
         new_detail = {
             field: detail[field] + batch[field] for field in _DETAIL_FIELDS
         }
-        self._apply(batch, to_session, to_history)
+        self._apply(batch, stats, to_history)
         self._store(
             files_map, path, base + last_newline + 1, size, True, new_detail
         )
@@ -428,7 +584,7 @@ class UsageReader:
         state.update(detail)
         files_map[path] = state
 
-    def _apply(self, batch, to_session, to_history):
+    def _apply(self, batch, stats, to_history):
         """把一批解析结果加到全局计数器（锁内执行，不碰磁盘）。"""
         with self._state_lock:
             # 历史口径只由历史扫描写入，避免会话扫描重复累加
@@ -440,31 +596,11 @@ class UsageReader:
                 self._h_out += batch["out"]
                 self._h_records += batch["records"]
 
-            if to_session:
-                self._s_hit += batch["hit"]
-                self._s_miss += batch["miss"]
-                self._s_prompt += batch["prompt"]
-                self._s_cached += batch["cached"]
-                self._s_out += batch["out"]
-                self._s_records += batch["records"]
-                self._apply_session_extras(batch)
+            if stats is not None:
+                stats.apply(batch)
 
-    def _apply_session_extras(self, batch):
-        """更新会话口径的时间范围/上下文/模型/速率样本（调用方已持锁）。"""
-        min_ts = batch["min_ts"]
-        max_ts = batch["max_ts"]
-        if min_ts and (self._s_min_ts == 0 or min_ts < self._s_min_ts):
-            self._s_min_ts = min_ts
-        if max_ts > self._s_max_ts:
-            self._s_max_ts = max_ts
-            self._s_last_prompt = batch["last_prompt"]
-        if batch["model"]:
-            self._s_model = batch["model"]
-        if batch["samples"]:
-            self._samples.extend(batch["samples"])
-
-    def _rollback(self, detail, to_session, to_history):
-        """把某文件此前计入的明细从全局计数器扣回，max(0, …) 兜底不减成负数。"""
+    def _rollback(self, detail, stats, to_history):
+        """把某文件此前计入的明细从计数器扣回，max(0, …) 兜底不减成负数。"""
         with self._state_lock:
             if to_history:
                 self._h_hit = max(0, self._h_hit - detail["hit"])
@@ -474,20 +610,15 @@ class UsageReader:
                 self._h_out = max(0, self._h_out - detail["out"])
                 self._h_records = max(0, self._h_records - detail["records"])
 
-            if to_session:
-                self._s_hit = max(0, self._s_hit - detail["hit"])
-                self._s_miss = max(0, self._s_miss - detail["miss"])
-                self._s_prompt = max(0, self._s_prompt - detail["prompt"])
-                self._s_cached = max(0, self._s_cached - detail["cached"])
-                self._s_out = max(0, self._s_out - detail["out"])
-                self._s_records = max(0, self._s_records - detail["records"])
+            if stats is not None:
+                stats.rollback(detail)
 
-    def _parse(self, blob, to_session, to_history=True):
+    def _parse(self, blob, want_extras):
         """解析一批完整行，返回本批汇总，不写任何全局状态（可在锁外调用）。
 
-        计数类字段总是有值；min_ts/max_ts/last_prompt/model/samples 只在
-        to_session 为 True 时有意义（会话口径专用）。to_history 参数保留以
-        维持调用签名，计数归属改由 _consume 在加总时决定。
+        计数类字段总是有值；min_ts/max_ts/last_prompt/model/title/samples
+        只在 want_extras 为 True 时有意义（会话口径专用）。to_history 归属
+        改由 _consume 在加总时决定。
         """
         keep_after = time.time() * 1000.0 - SPEED_KEEP_MS
         hit = miss = prompt = cached = out = records = 0
@@ -496,15 +627,30 @@ class UsageReader:
         max_ts = 0
         last_prompt = 0
         model = ""
+        title = ""
+        title_ts = 0
 
         for line in blob.split(b"\n"):
-            if not line or b'"rawUsage"' not in line:
+            if not line:
+                continue
+            if b'"rawUsage"' not in line and b'"ai-title"' not in line:
                 continue
             try:
                 record = json.loads(line.decode("utf-8", "replace"))
             except Exception:
                 continue
             if not isinstance(record, dict):
+                continue
+
+            # 会话标题：日志里的 ai-title 记录，取时间最新的一条
+            if record.get("type") == "ai-title":
+                if want_extras:
+                    text = record.get("aiTitle")
+                    ts = _to_ms(record.get("timestamp"))
+                    if isinstance(text, str) and text.strip():
+                        if ts >= title_ts:
+                            title = text.strip()
+                            title_ts = ts
                 continue
 
             usage = None
@@ -536,7 +682,7 @@ class UsageReader:
                 detail = _to_int(usage.get("cached_tokens"))
             cached += detail
 
-            if not to_session:
+            if not want_extras:
                 continue
 
             ts = _to_ms(record.get("timestamp"))
@@ -564,6 +710,8 @@ class UsageReader:
             "max_ts": max_ts,
             "last_prompt": last_prompt,
             "model": model,
+            "title": title,
+            "title_ts": title_ts,
             "samples": samples,
         }
 
@@ -595,45 +743,31 @@ class UsageReader:
 
     def _build(self, now):
         """在 _state_lock 保护下汇总，纯内存操作。"""
-        # 速率：最近 60 秒窗口内 completion_tokens 之和 ÷ (现在 - 窗口最早样本)
-        # 窗口锚到「现在」而非首尾样本，单条样本也能给出数值；窗口内最新样本
-        # 已超过 SPEED_IDLE_MS 没更新，说明生成已停，速率置空并标记空闲。
         now_ms = now * 1000.0
         cutoff = now_ms - SPEED_WINDOW_MS
         keep = now_ms - SPEED_KEEP_MS
-        while self._samples and self._samples[0][0] < keep:
-            self._samples.popleft()
 
-        window = [s for s in self._samples if s[0] >= cutoff]
-        speed = None
-        speed_idle = False
-        if window:
-            newest = max(s[0] for s in window)
-            if now_ms - newest > SPEED_IDLE_MS:
-                speed = None
-                speed_idle = True
-            else:
-                span = max(1.0, (now_ms - min(s[0] for s in window)) / 1000.0)
-                speed = sum(s[1] for s in window) / span
-                if speed < 0.0:
-                    speed = None
+        ordered = sorted(
+            self._sessions.values(),
+            key=lambda stats: stats.last_mtime,
+            reverse=True,
+        )
+        rows = [
+            stats.row(now, now_ms, cutoff, keep) for stats in ordered
+        ]
+        primary = rows[0] if rows else {}
 
-        duration = 0.0
-        if self._s_min_ts and self._s_max_ts > self._s_min_ts:
-            duration = (self._s_max_ts - self._s_min_ts) / 1000.0
-
-        return {
-            # 会话口径
-            "hit_rate": _ratio(
-                self._s_hit, self._s_miss, self._s_prompt, self._s_cached
-            ),
-            "total_out": self._s_out,
-            "records": self._s_records,
-            "hit_tokens": self._s_hit,
-            "miss_tokens": self._s_miss,
-            "context_tokens": self._s_last_prompt,
-            "session_duration": duration,
-            "model": self._s_model,
+        result = {
+            # 会话口径（最新会话，保持原有字段语义）
+            "hit_rate": primary.get("hit_rate"),
+            "total_out": primary.get("total_out", 0),
+            "records": primary.get("records", 0),
+            "hit_tokens": primary.get("hit_tokens", 0),
+            "miss_tokens": primary.get("miss_tokens", 0),
+            "context_tokens": primary.get("context_tokens", 0),
+            "session_duration": primary.get("session_duration", 0.0),
+            "model": primary.get("model", ""),
+            "title": primary.get("title", ""),
             # 历史口径
             "history_hit_rate": _ratio(
                 self._h_hit, self._h_miss, self._h_prompt, self._h_cached
@@ -643,11 +777,16 @@ class UsageReader:
             "history_hit_tokens": self._h_hit,
             "history_miss_tokens": self._h_miss,
             "history_ready": self._h_ready,
+            # 多会话
+            "sessions": rows,
+            "session_count": self._session_total,
+            "session_multi": self._multi,
             # 通用
-            "speed": speed,
-            "speed_idle": speed_idle,
+            "speed": primary.get("speed"),
+            "speed_idle": primary.get("speed_idle", False),
             "files": self._file_count,
             "active_file": self._active_file,
             "updated_at": now,
             "error": None,
         }
+        return result

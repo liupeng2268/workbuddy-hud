@@ -33,6 +33,12 @@ SCOPE_OPTIONS = [
     ("history", "全历史"),
 ]
 
+#: 会话展示模式
+VIEW_MODE_OPTIONS = [
+    ("single", "单会话"),
+    ("multi", "多会话"),
+]
+
 #: 第三行可显示的指标
 LINE3_OPTIONS = [
     ("session_out", "会话输出"),
@@ -54,6 +60,7 @@ OPACITY_OPTIONS = [1.0, 0.95, 0.9, 0.85, 0.8]
 DEFAULT_CONFIG = {
     "hit_rate_scope": "session",
     "line3": "session_out",
+    "view_mode": "single",
     "refresh_ms": 1000,
     "opacity": 1.0,
     # 窗口上次位置；None 表示还没有记忆过，启动时回落到右下角
@@ -79,6 +86,8 @@ def _load_config():
         cfg["hit_rate_scope"] = DEFAULT_CONFIG["hit_rate_scope"]
     if cfg.get("line3") not in [k for k, _ in LINE3_OPTIONS]:
         cfg["line3"] = DEFAULT_CONFIG["line3"]
+    if cfg.get("view_mode") not in [k for k, _ in VIEW_MODE_OPTIONS]:
+        cfg["view_mode"] = DEFAULT_CONFIG["view_mode"]
     try:
         cfg["refresh_ms"] = int(cfg["refresh_ms"])
     except (TypeError, ValueError):
@@ -146,6 +155,17 @@ X_TEXT = 18
 Y_LINE1 = 32
 Y_LINE2 = 66
 Y_LINE3 = 92
+
+# 多会话列表：顶部标题 + 每个会话两行（标题 / 指标）+ 可选「+N 个」页脚
+MULTI_HEAD_Y = 22
+MULTI_TOP = 44                # 第一块标题行的垂直中心
+MULTI_BLOCK_H = 38            # 每个会话占两行的高度
+MULTI_METRIC_DY = 18          # 指标行相对标题行的垂直偏移
+MULTI_FOOT_H = 18             # 溢出提示占用高度
+MULTI_MIN_H = 100             # 多会话模式的最小窗口高度
+MULTI_MAX_ROWS = 3            # 与数据层 MAX_SESSIONS 对齐
+MULTI_SPEED_RIGHT = WIDTH - 16
+MULTI_TITLE_MAX = WIDTH - X_TEXT * 2
 
 FONT_CANDIDATES = ("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Tahoma")
 
@@ -260,6 +280,17 @@ def _clip(text, limit=30):
     return text
 
 
+def _fit_text(font, text, max_px):
+    """按实际像素宽度裁剪文本，超出部分用省略号收尾。"""
+    text = str(text)
+    if font.measure(text) <= max_px:
+        return text
+    ellipsis = "…"
+    while text and font.measure(text + ellipsis) > max_px:
+        text = text[:-1]
+    return (text + ellipsis) if text else ""
+
+
 def _pick_font_family(root):
     """优先 Microsoft YaHei UI，逐级回退。"""
     try:
@@ -274,9 +305,11 @@ def _pick_font_family(root):
 
 # ------------------------------------------------------------------ 窗口实现
 class _FloatingWindow(object):
-    def __init__(self, root, snapshot_provider, interval_ms):
+    def __init__(self, root, snapshot_provider, interval_ms,
+                 mode_setter=None):
         self.root = root
         self.provider = snapshot_provider
+        self.mode_setter = mode_setter
         # 配置文件不存在即视为首次运行，用于显示“右键设置”的引导
         self._first_run = not os.path.exists(CONFIG_PATH)
         self.cfg = _load_config()
@@ -295,7 +328,45 @@ class _FloatingWindow(object):
         self._hint_after = None
         self._hint_active = self._first_run
 
+        # 高 DPI 适配：进程声明 DPI 感知后（run_app 里启用），Tk 的字号会按
+        # 真实 DPI 自动放大（磅值字体），但写死的像素常量需要按系数换算，
+        # 否则窗口在高缩放屏上会显得只有 2/3 大小。96 DPI 下系数为 1，
+        # 数值与旧版完全一致，门禁断言不受影响。
+        self._dpi = max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
+        self.W = self._s(WIDTH)
+        self.H = self._s(HEIGHT)
+        self.RADIUS = self._s(RADIUS)
+        self.BORDER_W = max(1, self._s(1))
+        self.X_TEXT = self._s(X_TEXT)
+        self.Y_LINE1 = self._s(Y_LINE1)
+        self.Y_LINE2 = self._s(Y_LINE2)
+        self.Y_LINE3 = self._s(Y_LINE3)
+        self.MULTI_HEAD_Y = self._s(MULTI_HEAD_Y)
+        self.MULTI_TOP = self._s(MULTI_TOP)
+        self.MULTI_BLOCK_H = self._s(MULTI_BLOCK_H)
+        self.MULTI_METRIC_DY = self._s(MULTI_METRIC_DY)
+        self.MULTI_FOOT_H = self._s(MULTI_FOOT_H)
+        self.MULTI_MIN_H = self._s(MULTI_MIN_H)
+        self.MIN_VISIBLE_W = self._s(MIN_VISIBLE_W)
+        self.MIN_VISIBLE_H = self._s(MIN_VISIBLE_H)
+        self.MARGIN_RIGHT = self._s(MARGIN_RIGHT)
+        self.MARGIN_BOTTOM = self._s(MARGIN_BOTTOM)
+        self.MULTI_SPEED_RIGHT = self.W - self._s(16)
+        self.MULTI_TITLE_MAX = self.W - self.X_TEXT * 2
+
+        # 布局状态：单会话固定 268x116（按 DPI 换算后），多会话按行数自适应高度
+        self._height = self.H
+        self._layout_sig = None
+        self._text_items = []
+        self._row_items = []
+        self._bg_item = None
+        self.item_head = None
+        self.item_foot = None
+
         self.family = _pick_font_family(root)
+        self.font9 = tkfont.Font(family=self.family, size=9)
+        self.font9b = tkfont.Font(family=self.family, size=9, weight="bold")
+        self.font8 = tkfont.Font(family=self.family, size=8)
 
         root.overrideredirect(True)
         root.attributes("-topmost", True)
@@ -316,8 +387,8 @@ class _FloatingWindow(object):
         key = TRANSPARENT_KEY if self._rounded else BG
         self.canvas = tk.Canvas(
             root,
-            width=WIDTH,
-            height=HEIGHT,
+            width=self.W,
+            height=self.H,
             bg=key,
             highlightthickness=0,
             bd=0,
@@ -330,6 +401,9 @@ class _FloatingWindow(object):
         self._build_menu()
         self._bind_events()
         self._place_initial()
+
+        # 把界面里的展示模式同步给数据层（多会话需要数据层换扫描策略）
+        self._notify_mode()
 
         # 先把窗口画出来再加载数据：首次全量扫描约 2.5 秒，若直接调用
         # _refresh()，用户会在这段时间里看不到任何窗口。update() 之后
@@ -350,29 +424,44 @@ class _FloatingWindow(object):
                 self._hint_active = False
 
     # ---------------------------------------------------------- 静态绘制
+    def _s(self, value):
+        """把 96 DPI 基准的逻辑像素换算为当前 DPI 的物理像素。"""
+        return int(round(value * self._dpi))
+
     def _draw_background(self):
-        r = RADIUS
+        if self._bg_item is not None:
+            try:
+                self.canvas.delete(self._bg_item)
+            except tk.TclError:
+                pass
+            self._bg_item = None
+        r = self.RADIUS
         x1, y1 = 0.5, 0.5
-        x2, y2 = WIDTH - 0.5, HEIGHT - 0.5
+        x2, y2 = self.W - 0.5, self._height - 0.5
         points = [
             x1 + r, y1, x2 - r, y1, x2, y1,
             x2, y1 + r, x2, y2 - r, x2, y2,
             x2 - r, y2, x1 + r, y2, x1, y2,
             x1, y2 - r, x1, y1 + r, x1, y1,
         ]
-        self.canvas.create_polygon(
+        self._bg_item = self.canvas.create_polygon(
             points,
             smooth=True,
             splinesteps=32,
             fill=BG,
             outline=BORDER,
-            width=1,
+            width=self.BORDER_W,
         )
+        # 背景是在文字之后重建的（切换多会话会改高度），必须压回最底层，
+        # 否则新背景会盖住所有文字。
+        self.canvas.tag_lower(self._bg_item)
 
     def _build_text_items(self):
+        """三行单会话布局（多会话模式会先清空这些 item）。"""
+        self._clear_text_items()
         # 第一行：命中率，大号 + 强调色
         self.item_rate = self.canvas.create_text(
-            X_TEXT, Y_LINE1,
+            self.X_TEXT, self.Y_LINE1,
             text="命中率 --",
             anchor="w",
             fill=MUTED,
@@ -380,7 +469,7 @@ class _FloatingWindow(object):
         )
         # 第二行：速率，中号
         self.item_speed = self.canvas.create_text(
-            X_TEXT, Y_LINE2,
+            self.X_TEXT, self.Y_LINE2,
             text="-- tok/s",
             anchor="w",
             fill=FG,
@@ -388,12 +477,26 @@ class _FloatingWindow(object):
         )
         # 第三行：累计输出 + 文件数，小字次要色
         self.item_total = self.canvas.create_text(
-            X_TEXT, Y_LINE3,
+            self.X_TEXT, self.Y_LINE3,
             text="会话 -- tok · -- 条",
             anchor="w",
             fill=MUTED,
             font=(self.family, 9),
         )
+        self._text_items = [self.item_rate, self.item_speed, self.item_total]
+        self.item_head = None
+        self.item_foot = None
+        self._row_items = []
+        self._layout_sig = ("single", 0, False)
+
+    def _clear_text_items(self):
+        """只删文字 item，保留背景多边形。"""
+        for item in self._text_items:
+            try:
+                self.canvas.delete(item)
+            except tk.TclError:
+                pass
+        self._text_items = []
 
     def _build_menu(self):
         self.menu = tk.Menu(
@@ -447,40 +550,73 @@ class _FloatingWindow(object):
     def _clamp_position(self, x, y):
         """把窗口坐标钳到「至少 MIN_VISIBLE_W x MIN_VISIBLE_H 可见」。"""
         left, top, right, bottom = self._screen_bounds()
-        min_x = left - WIDTH + MIN_VISIBLE_W
-        max_x = right - MIN_VISIBLE_W
-        min_y = top - HEIGHT + MIN_VISIBLE_H
-        max_y = bottom - MIN_VISIBLE_H
+        min_x = left - self.W + self.MIN_VISIBLE_W
+        max_x = right - self.MIN_VISIBLE_W
+        min_y = top - self._height + self.MIN_VISIBLE_H
+        max_y = bottom - self.MIN_VISIBLE_H
         x = min(max(int(x), min_x), max_x)
         y = min(max(int(y), min_y), max_y)
         return x, y
 
     def _place_initial(self):
-        """优先用上次记住的位置，与桌面无交集时回落到右下角。"""
+        """优先用上次记住的位置，与桌面无交集时回落到右下角。
+
+        设置.json 里存的是「逻辑坐标」（96 DPI 基准）：保存时把物理坐标
+        除以缩放系数，使用时乘回去。这样同一份配置在任意缩放的机器上
+        都落在相近位置，也不存在新旧版本坐标口径不一致的问题。
+        """
         x = self.cfg.get("x")
         y = self.cfg.get("y")
-        if x is not None and y is not None and self._intersects_screen(x, y):
-            self.root.geometry("{}x{}+{}+{}".format(WIDTH, HEIGHT, int(x), int(y)))
-            return
+        if x is not None and y is not None:
+            px = int(round(float(x) * self._dpi))
+            py = int(round(float(y) * self._dpi))
+            if self._intersects_screen(px, py):
+                self.root.geometry(
+                    "{}x{}+{}+{}".format(self.W, self._height, px, py)
+                )
+                return
         self._place_bottom_right()
 
     def _intersects_screen(self, x, y):
         """窗口与桌面矩形是否有交集（负坐标合法，多显示器也成立）。"""
         left, top, right, bottom = self._screen_bounds()
-        return x + WIDTH > left and y + HEIGHT > top and x < right and y < bottom
+        return (x + self.W > left and y + self._height > top
+                and x < right and y < bottom)
 
     def _place_bottom_right(self):
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        x = max(0, screen_w - WIDTH - MARGIN_RIGHT)
-        y = max(0, screen_h - HEIGHT - MARGIN_BOTTOM)
+        x = max(0, screen_w - self.W - self.MARGIN_RIGHT)
+        y = max(0, screen_h - self._height - self.MARGIN_BOTTOM)
         # 多显示器 / 缩放比例不一致时，算出的位置可能落到可见区域之外，
         # 表现为「双击后看不到窗口」。越界就退回左上角安全位置。
-        if screen_w > 0 and (x + WIDTH > screen_w or x < 0):
-            x = 80
-        if screen_h > 0 and (y + HEIGHT > screen_h or y < 0):
-            y = 80
-        self.root.geometry("{}x{}+{}+{}".format(WIDTH, HEIGHT, x, y))
+        if screen_w > 0 and (x + self.W > screen_w or x < 0):
+            x = self._s(80)
+        if screen_h > 0 and (y + self._height > screen_h or y < 0):
+            y = self._s(80)
+        self.root.geometry(
+            "{}x{}+{}+{}".format(self.W, self._height, x, y)
+        )
+
+    def _set_height(self, height):
+        """切换单/多会话布局时调整窗口高度，保持左上角不动。"""
+        height = max(self.MULTI_MIN_H, int(height))
+        if height == self._height:
+            return
+        try:
+            x = int(self.root.winfo_x())
+            y = int(self.root.winfo_y())
+        except (tk.TclError, ValueError):
+            x, y = 0, 0
+        self._height = height
+        try:
+            self.root.geometry(
+                "{}x{}+{}+{}".format(self.W, height, x, y)
+            )
+            self.canvas.configure(height=height)
+        except tk.TclError:
+            pass
+        self._draw_background()
 
     # ---------------------------------------------------------- 拖动
     def _on_press(self, event):
@@ -497,7 +633,7 @@ class _FloatingWindow(object):
         self.root.geometry("+{}+{}".format(x, y))
 
     def _on_release(self, event):
-        """松开鼠标后记住位置；写盘失败不影响拖动，故忽略返回值。"""
+        """松开鼠标后记住位置（存逻辑坐标）；写盘失败不影响拖动。"""
         if not self._alive:
             return
         try:
@@ -505,10 +641,13 @@ class _FloatingWindow(object):
             y = int(self.root.winfo_y())
         except (tk.TclError, ValueError):
             return
-        if self.cfg.get("x") == x and self.cfg.get("y") == y:
+        # 物理像素 -> 逻辑像素，便于跨 DPI 环境复用
+        lx = int(round(x / self._dpi))
+        ly = int(round(y / self._dpi))
+        if self.cfg.get("x") == lx and self.cfg.get("y") == ly:
             return
-        self.cfg["x"] = x
-        self.cfg["y"] = y
+        self.cfg["x"] = lx
+        self.cfg["y"] = ly
         _save_config(self.cfg)
 
     # ---------------------------------------------------------- 右键菜单
@@ -522,6 +661,16 @@ class _FloatingWindow(object):
                 pass
 
     # ---------------------------------------------------------- 设置窗口
+    def _notify_mode(self):
+        """把展示模式同步给数据层（多会话切换扫描策略）。"""
+        setter = self.mode_setter
+        if setter is None:
+            return
+        try:
+            setter(self.cfg.get("view_mode") == "multi")
+        except Exception:
+            pass
+
     def _apply_config(self):
         """把配置应用到窗口：透明度、刷新间隔、立即重绘。"""
         try:
@@ -532,6 +681,7 @@ class _FloatingWindow(object):
             self.interval_ms = max(200, int(self.cfg.get("refresh_ms") or 1000))
         except (TypeError, ValueError):
             self.interval_ms = 1000
+        self._notify_mode()
         self._schedule()
         self._refresh()
 
@@ -554,10 +704,11 @@ class _FloatingWindow(object):
         win.attributes("-topmost", True)
         win.resizable(False, False)
         win.geometry(
-            "352x372+%d+%d"
+            "%dx%d+%d+%d"
             % (
-                max(0, self.root.winfo_x() - 20),
-                max(0, self.root.winfo_y() - 400),
+                self._s(352), self._s(410),
+                max(0, self.root.winfo_x() - self._s(20)),
+                max(0, self.root.winfo_y() - self._s(400)),
             )
         )
 
@@ -577,11 +728,13 @@ class _FloatingWindow(object):
         head = tk.Label(
             win, text="显示设置", bg=BG, fg=FG, font=(self.family, 11, "bold")
         )
-        head.grid(row=0, column=0, columnspan=2, sticky="w", padx=16, pady=(14, 10))
+        head.grid(row=0, column=0, columnspan=2, sticky="w",
+                  padx=self._s(16), pady=(self._s(14), self._s(10)))
 
         rows = [
             ("命中率口径", SCOPE_OPTIONS, "hit_rate_scope"),
             ("第三行显示", LINE3_OPTIONS, "line3"),
+            ("会话显示", VIEW_MODE_OPTIONS, "view_mode"),
             ("刷新间隔", [(str(v), "%g 秒" % (v / 1000.0)) for v in REFRESH_OPTIONS], "refresh_ms"),
             ("窗口透明度", [(str(v), "%d%%" % round(v * 100)) for v in OPACITY_OPTIONS], "opacity"),
         ]
@@ -590,7 +743,8 @@ class _FloatingWindow(object):
         for index, (label, options, key) in enumerate(rows, start=1):
             tk.Label(
                 win, text=label, bg=BG, fg=MUTED, font=(self.family, 9)
-            ).grid(row=index, column=0, sticky="w", padx=(16, 8), pady=5)
+            ).grid(row=index, column=0, sticky="w",
+                   padx=(self._s(16), self._s(8)), pady=self._s(5))
 
             current = self.cfg.get(key)
             current_label = _label_of(options, str(current))
@@ -598,7 +752,8 @@ class _FloatingWindow(object):
             variables[key] = (var, options)
             menu_widget = tk.OptionMenu(win, var, *[lbl for _, lbl in options])
             style_option(menu_widget)
-            menu_widget.grid(row=index, column=1, sticky="e", padx=(0, 16), pady=5)
+            menu_widget.grid(row=index, column=1, sticky="e",
+                             padx=(0, self._s(16)), pady=self._s(5))
 
         def close():
             self._settings_win = None
@@ -641,7 +796,8 @@ class _FloatingWindow(object):
             )
 
         bar = tk.Frame(win, bg=BG)
-        bar.grid(row=len(rows) + 1, column=0, columnspan=2, pady=(16, 6))
+        bar.grid(row=len(rows) + 1, column=0, columnspan=2,
+                 pady=(self._s(16), self._s(6)))
         button(bar, "保存", do_save, primary=True).pack(side="right", padx=(8, 0))
         button(bar, "取消", close).pack(side="right")
 
@@ -651,9 +807,10 @@ class _FloatingWindow(object):
             bg=BG,
             fg=ACCENT_LOW,
             font=(self.family, 9),
-            wraplength=320,
+            wraplength=self._s(320),
             justify="left",
-        ).grid(row=len(rows) + 2, column=0, columnspan=2, padx=16, pady=(0, 12))
+        ).grid(row=len(rows) + 2, column=0, columnspan=2,
+               padx=self._s(16), pady=(0, self._s(12)))
 
         win.protocol("WM_DELETE_WINDOW", close)
 
@@ -717,12 +874,18 @@ class _FloatingWindow(object):
 
     def _render(self, snapshot, error):
         if error:
+            self._ensure_layout("single")
             message = _clip(error, 40) or "数据读取异常"
             self.canvas.itemconfigure(self.item_rate, text="数据读取异常", fill=ACCENT_LOW)
             self.canvas.itemconfigure(self.item_speed, text="命中率 -- · 速率 --", fill=MUTED)
             self.canvas.itemconfigure(self.item_total, text=message, fill=MUTED)
             return
 
+        if self.cfg.get("view_mode") == "multi":
+            self._render_multi(snapshot)
+            return
+
+        self._ensure_layout("single")
         # 第一行：按设置选用会话口径或历史口径
         scope = self.cfg.get("hit_rate_scope")
         if scope == "history":
@@ -765,6 +928,111 @@ class _FloatingWindow(object):
             fill=MUTED,
         )
 
+    # ---------------------------------------------------------- 多会话渲染
+    def _multi_height(self, rows, overflow):
+        area = max(1, rows) * self.MULTI_BLOCK_H
+        foot = self.MULTI_FOOT_H if overflow else 0
+        return max(self.MULTI_MIN_H,
+                   self.MULTI_TOP + area - self._s(6) + foot + self._s(10))
+
+    def _ensure_layout(self, mode, rows=0, overflow=False):
+        """布局签名变化时才重建文字 item 并调整窗口高度。"""
+        signature = (mode, rows, bool(overflow))
+        if signature == self._layout_sig:
+            return
+        if mode == "multi":
+            self._build_multi_items(rows, overflow)
+            self._set_height(self._multi_height(rows, overflow))
+        else:
+            self._build_text_items()
+            self._set_height(self.H)
+
+    def _build_multi_items(self, rows, overflow):
+        self._clear_text_items()
+        self.item_head = self.canvas.create_text(
+            self.X_TEXT, self.MULTI_HEAD_Y,
+            text="进行中 0 个会话",
+            anchor="w",
+            fill=MUTED,
+            font=self.font9,
+        )
+        self._text_items.append(self.item_head)
+        self._row_items = []
+        for index in range(rows):
+            top = self.MULTI_TOP + index * self.MULTI_BLOCK_H
+            title = self.canvas.create_text(
+                self.X_TEXT, top, text="", anchor="w", fill=FG, font=self.font9
+            )
+            rate = self.canvas.create_text(
+                self.X_TEXT, top + self.MULTI_METRIC_DY, text="", anchor="w",
+                fill=MUTED, font=self.font9b
+            )
+            speed = self.canvas.create_text(
+                self.MULTI_SPEED_RIGHT, top + self.MULTI_METRIC_DY,
+                text="", anchor="e",
+                fill=MUTED, font=self.font8
+            )
+            self._row_items.append((title, rate, speed))
+            self._text_items.extend((title, rate, speed))
+        self.item_foot = None
+        if overflow:
+            self.item_foot = self.canvas.create_text(
+                self.X_TEXT, self.MULTI_TOP + rows * self.MULTI_BLOCK_H,
+                text="", anchor="w", fill=MUTED, font=self.font8,
+            )
+            self._text_items.append(self.item_foot)
+        self.item_rate = None
+        self.item_speed = None
+        self.item_total = None
+        self._layout_sig = ("multi", rows, bool(overflow))
+
+    def _render_multi(self, snapshot):
+        rows = snapshot.get("sessions")
+        if not isinstance(rows, list):
+            rows = []
+        rows = rows[:MULTI_MAX_ROWS]
+        total = _as_int(snapshot.get("session_count"))
+        if total is None or total < len(rows):
+            total = len(rows)
+        overflow = max(0, total - len(rows))
+
+        self._ensure_layout("multi", len(rows), overflow)
+
+        head = (
+            "进行中 %d 个会话" % total if total
+            else "最近 10 分钟无会话"
+        )
+        self.canvas.itemconfigure(self.item_head, text=head, fill=MUTED)
+
+        for index, items in enumerate(self._row_items):
+            title_item, rate_item, speed_item = items
+            if index >= len(rows):
+                for item in items:
+                    self.canvas.itemconfigure(item, text="")
+                continue
+            row = rows[index] or {}
+            rate = row.get("hit_rate")
+            title = _fit_text(
+                self.font9, row.get("title") or "--", self.MULTI_TITLE_MAX
+            )
+            speed = row.get("speed")
+            if speed is None and bool(row.get("speed_idle")):
+                speed_text = "空闲"
+            else:
+                speed_text = _fmt_speed(speed)
+            self.canvas.itemconfigure(title_item, text=title, fill=FG)
+            self.canvas.itemconfigure(
+                rate_item,
+                text="命中率 " + _fmt_percent(rate),
+                fill=_accent_for(rate),
+            )
+            self.canvas.itemconfigure(speed_item, text=speed_text, fill=MUTED)
+
+        if self.item_foot is not None:
+            self.canvas.itemconfigure(
+                self.item_foot, text="+%d 个会话" % overflow, fill=MUTED
+            )
+
     def _clear_hint(self):
         """首次运行提示到期，恢复第三行的真实指标。"""
         self._hint_after = None
@@ -796,6 +1064,21 @@ class _FloatingWindow(object):
         active = snap.get("active_file")
         if active:
             lines.append("活跃文件: " + str(active))
+        sessions = snap.get("sessions")
+        if snap.get("session_multi") and isinstance(sessions, list):
+            lines.append(
+                "进行中会话: {}".format(
+                    _as_int(snap.get("session_count")) or len(sessions)
+                )
+            )
+            for row in sessions:
+                lines.append(
+                    "  {} | {} | {}".format(
+                        row.get("title") or "--",
+                        _fmt_percent(row.get("hit_rate")),
+                        _fmt_speed(row.get("speed")),
+                    )
+                )
         return "\n".join(lines)
 
     def _copy_snapshot(self):
@@ -833,15 +1116,38 @@ class _FloatingWindow(object):
 
 
 # ------------------------------------------------------------------ 对外入口
-def run_app(snapshot_provider, interval_ms=1000):
+def _enable_windows_dpi_awareness():
+    """声明进程 DPI 感知，避免高缩放屏把整窗位图拉伸导致文字发虚。
+
+    必须在创建任何窗口之前调用；只在打包入口 run_app 里启用，
+    门禁脚本直接实例化 _FloatingWindow，进程仍按 96 DPI 虚拟化，
+    缩放系数恒为 1，断言行为与旧版一致。
+    非 Windows 或调用失败时静默跳过，界面退回旧的逻辑像素行为。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            # System DPI aware：按主屏缩放原生渲染（Win 8.1+）
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def run_app(snapshot_provider, interval_ms=1000, mode_setter=None):
     """阻塞式运行悬浮窗。
 
     snapshot_provider: 无参 callable，返回契约约定的快照 dict。
     interval_ms: 刷新间隔（毫秒）。
+    mode_setter: 可选 callable(bool)，界面切换单/多会话时通知数据层。
     """
+    _enable_windows_dpi_awareness()
     root = tk.Tk()
     root.title("WorkBuddy 用量 v%s" % _APP_VERSION)
-    _FloatingWindow(root, snapshot_provider, interval_ms)
+    _FloatingWindow(root, snapshot_provider, interval_ms, mode_setter)
     root.mainloop()
 
 

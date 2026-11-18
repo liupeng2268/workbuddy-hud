@@ -97,7 +97,7 @@ def main() -> None:
         raise
 
     reader = UsageReader(projects_dir)
-    run_app(reader.snapshot, interval_ms=1000)
+    run_app(reader.snapshot, interval_ms=1000, mode_setter=reader.set_multi)
 
 
 if __name__ == "__main__":
