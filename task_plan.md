@@ -9,7 +9,7 @@ WorkBuddy 桌面悬浮窗按会话展示缓存命中率与生成速率（多会�
 
 ## Next Step
 
-等待用户目测确认 v1.1.1：悬浮窗文字清晰度 + 右键菜单弹出位置是否在鼠标处（见 findings.md P9）。
+v1.3.1（WorkBuddy 速率 5 分钟窗口）已打包：深度思考会话速率从 `--` 变为有值（实测 48.4 tok/s），全门禁 43+56+21 项绿。等待用户手动双击 exe 冒烟确认。
 
 ## Current Phase
 
@@ -50,10 +50,58 @@ Phase 6（交付与观察）：v1.1.1 已发布运行，等待用户目测反馈
 
 ### Phase 6: 交付与观察
 
-- [ ] 用户目测：文字清晰度
-- [ ] 用户目测：右键菜单位置（DPI 感知下 tk_popup 坐标待验证）
-- [ ] 真实环境三会话同屏 + 溢出提示核对（低优先）
-- **Status:** in_progress
+- [x] 用户目测：文字清晰度（已确认恢复清晰）
+- [x] 用户目测：右键菜单位置（已确认在鼠标处弹出，P9 验证通过）
+- [x] 多会话代码静态核对 + 门禁回归（40/40、47/47、verify_text PASS、编译 OK）
+- [x] README 补全多会话与高 DPI 文档
+- [x] 真实环境三会话同屏 + 溢出提示核对（用户截图视觉识别：3 块同屏、每块两行、顶部计数、文字清晰；未超上限故无溢出页脚，符合规格）
+- **Status:** complete（2026-11-18 交付收尾）
+
+### Phase 7: ZCode 会话接入（2026-11-19）
+
+- [x] 数据源调研：确定 db.sqlite 的 model_usage + session 联表（P11~P13）
+- [x] 新建 `zcode_reader.py`：命中率原生口径、10 分钟活跃窗口、倒序、标题回退、db 缺失容错（findings P12/P15）
+- [x] 入口组合 provider + 「ZCode(多会话)」设置开关，默认关，UI 渲染零改动（P14）
+- [x] 验证：编译 OK、verify_data_reader 40/40、ui_pretest 47/47、verify_text PASS、verify_zcode 15/15
+- [x] 打包 v1.2.0（PE 版本 1.2.0、SHA256 5C9E2F64…2ADE2FFCC、PYZ 含 zcode_reader）、备份 v1.1.1
+- [ ] 运行时冒烟：用户手动双击 exe 验证（代理会话 WMI 启动被拦截，见 P15）
+- **Status:** in_progress（待用户手动冒烟）
+
+### Phase 8: ZCode 速率不显示修复（2026-11-19 晚）
+
+- [x] 定位根因：started_at 时间戳致长调用过期 + 单样本虚高 + 输出一次性写库（P16/P17）
+- [x] 修 completed_at 口径 + 调用真实时长作分母 + 5 分钟窗口（用户选「放宽到 5 分钟」）
+- [x] verify_zcode 扩到 20/20；真实库验证 3 会话速率 38.9/36.0/64.4 tok/s
+- [x] 打包 v1.2.1（PE 1.2.1、SHA256 `537FA482…42512F`）、备份 v1.2.0
+- [ ] 用户手动双击 exe 冒烟确认速率列
+- **Status:** in_progress（代码完成，待用户冒烟）
+
+### Phase 9: ZCode 命中率口径纠错（2026-11-19 深夜）
+
+- [x] 定位根因：旧口径 cacheRead/(cacheRead+input) 分母多算一次 → 永远 ≤50%（P19）
+- [x] 解包 ZCode app.asar 找到权威公式 cacheRead/input（找到 contextCacheUsageFromPayload）
+- [x] 改口径 + 新增「不腰斩」回归断言；verify_zcode 21/21；真实库 95.8%/65.9%/89.5%
+- [x] 打包 v1.2.2（PE 1.2.2、SHA256 `07A7F1CD…DC6`），备份 v1.2.1
+- [ ] 用户手动双击 exe 冒烟确认命中率
+- **Status:** in_progress（代码完成，待用户冒烟）
+
+### Phase 10: 多会话展开/收起（2026-11-19 深夜）
+
+- [x] 数据层保留全部活跃会话（data_reader MAX_SESSIONS_EXPANDED=15、zcode_reader=15）
+- [x] UI 底部标志可点击：收起 `+N 个会话 ▼` / 展开 `▲ 收起`，点击/拖动区分
+- [x] 验证：UI 56/56（新增 8 项）、其余门禁全绿、点击链路单测通过
+- [x] 打包 v1.3.0（PE 1.3.0、SHA256 `BBDD1B24…E32E6725`），备份 v1.2.2
+- [ ] 用户手动双击 exe 冒烟确认展开/收起
+- **Status:** in_progress（代码完成，待用户冒烟）
+
+### Phase 11: 深度思考会话速率不显示（2026-11-20 00:05）
+
+- [x] 复现根因：Tailscale 会话 token 稀疏（267s/122s 间隔），60s 窗口 0 条、5min 窗口 2 条
+- [x] WorkBuddy 速率窗口 60s→5min、keep 10min、idle 6min（与 ZCode 统一）
+- [x] 真实库验证 `--` → 48.4 tok/s；新增 3 项窗口常量守卫，verify_data_reader 43/43
+- [x] 打包 v1.3.1（PE 1.3.1、SHA256 `88BF5A17…451E91`），备份 v1.3.0
+- [ ] 用户手动双击 exe 冒烟确认速率
+- **Status:** in_progress（代码完成，待用户冒烟）
 
 ## Key Questions
 
