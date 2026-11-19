@@ -50,18 +50,24 @@ NEW_FILE_TAIL_BYTES = 4 * 1024 * 1024
 #: 多会话模式下，日志在这么多秒内有写入才算「同时进行」
 ACTIVE_WINDOW_SEC = 10 * 60
 
-#: 多会话模式最多统计的会话数（界面按此上限显示，每会话两行）
+#: 多会话模式最多统计的会话数（界面收起时按此上限显示，每会话两行）
 MAX_SESSIONS = 3
 
-#: 速率的滑动窗口（毫秒）
-SPEED_WINDOW_MS = 60 * 1000
+#: 数据层保留的活跃会话上限。UI 可展开查看全部，故数据层需持有比
+#: 「收起显示数」更多的会话统计；设置 15 足够覆盖正常多开场景。
+MAX_SESSIONS_EXPANDED = 15
+
+#: 速率的滑动窗口（毫秒）。深度思考/工具执行阶段常连续数分钟不产出 token，
+#: 60 秒窗口会让速率几乎一直显示 --。放宽到 5 分钟，取「近期平均速率」，
+#: 与 ZCode 侧口径一致（findings.md P21）。
+SPEED_WINDOW_MS = 5 * 60 * 1000
 
 #: 样本保留时长（毫秒），比窗口更长，便于平滑过期判定
-SPEED_KEEP_MS = 180 * 1000
+SPEED_KEEP_MS = 10 * 60 * 1000
 
-#: 空闲判定阈值（毫秒）：窗口内最新样本比「现在」早这么多，视为已停止生成，
-#: 速率置空并由界面显示占位，避免停在旧数值上误导
-SPEED_IDLE_MS = 15000
+#: 空闲判定阈值（毫秒）：必须略大于 SPEED_WINDOW_MS，保证窗口内还有样本时
+#: 不会被误判为空闲；超过 6 分钟完全无输出才显示空闲
+SPEED_IDLE_MS = 6 * 60 * 1000
 
 #: 首调等待时间：0 表示不等待，后台扫描期间由界面显示占位
 PRIME_WAIT = 0.0
@@ -364,7 +370,7 @@ class UsageReader:
                     if 0 <= now - g["mtime"] <= ACTIVE_WINDOW_SEC
                 ]
                 total = len(active)
-                chosen = active[:MAX_SESSIONS]
+                chosen = active[:MAX_SESSIONS_EXPANDED]
             else:
                 chosen = groups[:1]
                 total = len(chosen)

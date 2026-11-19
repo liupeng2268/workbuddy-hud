@@ -57,10 +57,17 @@ REFRESH_OPTIONS = [500, 1000, 2000, 5000]
 #: 透明度候选
 OPACITY_OPTIONS = [1.0, 0.95, 0.9, 0.85, 0.8]
 
+#: ZCode 会话显示开关（仅多会话模式生效）
+ZCODE_OPTIONS = [
+    ("off", "关闭"),
+    ("on", "显示"),
+]
+
 DEFAULT_CONFIG = {
     "hit_rate_scope": "session",
     "line3": "session_out",
     "view_mode": "single",
+    "zcode_enabled": "off",
     "refresh_ms": 1000,
     "opacity": 1.0,
     # 窗口上次位置；None 表示还没有记忆过，启动时回落到右下角
@@ -88,6 +95,11 @@ def _load_config():
         cfg["line3"] = DEFAULT_CONFIG["line3"]
     if cfg.get("view_mode") not in [k for k, _ in VIEW_MODE_OPTIONS]:
         cfg["view_mode"] = DEFAULT_CONFIG["view_mode"]
+    # 兼容旧值：布尔 True 视为 on，其余非法值回退 off
+    if isinstance(cfg.get("zcode_enabled"), bool):
+        cfg["zcode_enabled"] = "on" if cfg["zcode_enabled"] else "off"
+    if cfg.get("zcode_enabled") not in [k for k, _ in ZCODE_OPTIONS]:
+        cfg["zcode_enabled"] = DEFAULT_CONFIG["zcode_enabled"]
     try:
         cfg["refresh_ms"] = int(cfg["refresh_ms"])
     except (TypeError, ValueError):
@@ -163,7 +175,8 @@ MULTI_BLOCK_H = 38            # 每个会话占两行的高度
 MULTI_METRIC_DY = 18          # 指标行相对标题行的垂直偏移
 MULTI_FOOT_H = 18             # 溢出提示占用高度
 MULTI_MIN_H = 100             # 多会话模式的最小窗口高度
-MULTI_MAX_ROWS = 3            # 与数据层 MAX_SESSIONS 对齐
+MULTI_MAX_ROWS = 3            # 收起时显示的会话行数
+MULTI_EXPANDED_MAX = 15       # 展开时最多显示的会话行数（与数据层上限对齐）
 MULTI_SPEED_RIGHT = WIDTH - 16
 MULTI_TITLE_MAX = WIDTH - X_TEXT * 2
 
@@ -324,6 +337,9 @@ class _FloatingWindow(object):
         self._last_error = None
         self._drag_dx = 0
         self._drag_dy = 0
+        self._press_x = 0             # 按下时的窗口坐标，用于区分点击与拖动
+        self._press_y = 0
+        self._expanded = False        # 多会话展开/收起状态（默认收起）
         self._after_id = None
         self._hint_after = None
         self._hint_active = self._first_run
@@ -622,6 +638,8 @@ class _FloatingWindow(object):
     def _on_press(self, event):
         self._drag_dx = event.x_root - self.root.winfo_x()
         self._drag_dy = event.y_root - self.root.winfo_y()
+        self._press_x = event.x_root
+        self._press_y = event.y_root
 
     def _on_drag(self, event):
         if not self._alive:
@@ -633,8 +651,14 @@ class _FloatingWindow(object):
         self.root.geometry("+{}+{}".format(x, y))
 
     def _on_release(self, event):
-        """松开鼠标后记住位置（存逻辑坐标）；写盘失败不影响拖动。"""
+        """松开鼠标：点击 footer 则切换展开，否则记住拖动后的位置。"""
         if not self._alive:
+            return
+        # 区分「点击」与「拖动」：位移很小且点在 footer 上才切换展开
+        moved = (abs(event.x_root - self._press_x)
+                 + abs(event.y_root - self._press_y)) > self._s(4)
+        if not moved and self._click_on_footer(event):
+            self._toggle_expanded()
             return
         try:
             x = int(self.root.winfo_x())
@@ -649,6 +673,27 @@ class _FloatingWindow(object):
         self.cfg["x"] = lx
         self.cfg["y"] = ly
         _save_config(self.cfg)
+
+    # ---------------------------------------------------------- 展开/收起
+    def _click_on_footer(self, event):
+        """点击是否落在「展开/收起」标志上（含少量容差）。"""
+        if self.item_foot is None:
+            return False
+        try:
+            box = self.canvas.bbox(self.item_foot)
+        except tk.TclError:
+            return False
+        if not box:
+            return False
+        pad = self._s(4)
+        # event.x/y 相对 canvas（canvas 填满窗口，坐标与窗口一致）
+        return (box[0] - pad <= event.x <= box[2] + pad
+                and box[1] - pad <= event.y <= box[3] + pad)
+
+    def _toggle_expanded(self):
+        """切换多会话展开/收起，立即重绘。"""
+        self._expanded = not self._expanded
+        self._render(self._last, self._last_error)
 
     # ---------------------------------------------------------- 右键菜单
     def _on_menu(self, event):
@@ -706,9 +751,9 @@ class _FloatingWindow(object):
         win.geometry(
             "%dx%d+%d+%d"
             % (
-                self._s(352), self._s(410),
+                self._s(352), self._s(440),
                 max(0, self.root.winfo_x() - self._s(20)),
-                max(0, self.root.winfo_y() - self._s(400)),
+                max(0, self.root.winfo_y() - self._s(430)),
             )
         )
 
@@ -735,6 +780,7 @@ class _FloatingWindow(object):
             ("命中率口径", SCOPE_OPTIONS, "hit_rate_scope"),
             ("第三行显示", LINE3_OPTIONS, "line3"),
             ("会话显示", VIEW_MODE_OPTIONS, "view_mode"),
+            ("ZCode(多会话)", ZCODE_OPTIONS, "zcode_enabled"),
             ("刷新间隔", [(str(v), "%g 秒" % (v / 1000.0)) for v in REFRESH_OPTIONS], "refresh_ms"),
             ("窗口透明度", [(str(v), "%d%%" % round(v * 100)) for v in OPACITY_OPTIONS], "opacity"),
         ]
@@ -929,25 +975,28 @@ class _FloatingWindow(object):
         )
 
     # ---------------------------------------------------------- 多会话渲染
-    def _multi_height(self, rows, overflow):
+    def _multi_height(self, rows, overflow, expanded=False):
         area = max(1, rows) * self.MULTI_BLOCK_H
-        foot = self.MULTI_FOOT_H if overflow else 0
+        foot = self.MULTI_FOOT_H if (overflow or expanded) else 0
         return max(self.MULTI_MIN_H,
                    self.MULTI_TOP + area - self._s(6) + foot + self._s(10))
 
-    def _ensure_layout(self, mode, rows=0, overflow=False):
-        """布局签名变化时才重建文字 item 并调整窗口高度。"""
-        signature = (mode, rows, bool(overflow))
+    def _ensure_layout(self, mode, rows=0, overflow=False, expanded=False):
+        """布局签名变化时才重建文字 item 并调整窗口高度。
+
+        expanded 也纳入签名：展开/收起切换时行数会变，footer 也需重建。
+        """
+        signature = (mode, rows, bool(overflow), bool(expanded))
         if signature == self._layout_sig:
             return
         if mode == "multi":
-            self._build_multi_items(rows, overflow)
-            self._set_height(self._multi_height(rows, overflow))
+            self._build_multi_items(rows, overflow, expanded)
+            self._set_height(self._multi_height(rows, overflow, expanded))
         else:
             self._build_text_items()
             self._set_height(self.H)
 
-    def _build_multi_items(self, rows, overflow):
+    def _build_multi_items(self, rows, overflow, expanded=False):
         self._clear_text_items()
         self.item_head = self.canvas.create_text(
             self.X_TEXT, self.MULTI_HEAD_Y,
@@ -975,7 +1024,8 @@ class _FloatingWindow(object):
             self._row_items.append((title, rate, speed))
             self._text_items.extend((title, rate, speed))
         self.item_foot = None
-        if overflow:
+        # 展开时也要 footer（显示「▲ 收起」）；收起时仅在有溢出时显示
+        if overflow or expanded:
             self.item_foot = self.canvas.create_text(
                 self.X_TEXT, self.MULTI_TOP + rows * self.MULTI_BLOCK_H,
                 text="", anchor="w", fill=MUTED, font=self.font8,
@@ -987,16 +1037,19 @@ class _FloatingWindow(object):
         self._layout_sig = ("multi", rows, bool(overflow))
 
     def _render_multi(self, snapshot):
-        rows = snapshot.get("sessions")
-        if not isinstance(rows, list):
-            rows = []
-        rows = rows[:MULTI_MAX_ROWS]
+        all_rows = snapshot.get("sessions")
+        if not isinstance(all_rows, list):
+            all_rows = []
         total = _as_int(snapshot.get("session_count"))
-        if total is None or total < len(rows):
-            total = len(rows)
+        if total is None or total < len(all_rows):
+            total = len(all_rows)
+
+        # 收起只显示 3 行，展开显示全部（上限 MULTI_EXPANDED_MAX）
+        limit = MULTI_EXPANDED_MAX if self._expanded else MULTI_MAX_ROWS
+        rows = all_rows[:limit]
         overflow = max(0, total - len(rows))
 
-        self._ensure_layout("multi", len(rows), overflow)
+        self._ensure_layout("multi", len(rows), overflow, self._expanded)
 
         head = (
             "进行中 %d 个会话" % total if total
@@ -1029,8 +1082,17 @@ class _FloatingWindow(object):
             self.canvas.itemconfigure(speed_item, text=speed_text, fill=MUTED)
 
         if self.item_foot is not None:
+            # footer 是可点击的展开/收起标志；即便溢出为 0（会话刚好 ≤3），
+            # 只要数据层还有更多行，也保留标志供展开
+            can_expand = overflow > 0 or len(all_rows) > MULTI_MAX_ROWS
+            if self._expanded:
+                text = "▲ 收起"
+            else:
+                text = "+%d 个会话 ▼" % overflow if overflow else "展开 ▼"
             self.canvas.itemconfigure(
-                self.item_foot, text="+%d 个会话" % overflow, fill=MUTED
+                self.item_foot,
+                text=text if can_expand or self._expanded else "",
+                fill=FG if self._expanded else MUTED,
             )
 
     def _clear_hint(self):

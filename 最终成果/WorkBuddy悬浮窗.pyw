@@ -10,6 +10,7 @@ WorkBuddy 悬浮窗 —— 缓存命中率 / 生成速率实时监控
 
 import os
 import sys
+import json
 import traceback
 import datetime
 
@@ -83,6 +84,48 @@ def _resolve_projects_dir() -> str:
     return candidates[0]
 
 
+def _zcode_enabled() -> bool:
+    """读取设置里的「ZCode 显示」开关，默认关；任何异常都当关处理。"""
+    try:
+        cfg_path = os.path.join(BASE_DIR, "设置.json")
+        with open(cfg_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        value = data.get("zcode_enabled", "off")
+        # 兼容新值 on/off 与旧布尔值
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("on", "true", "1", "yes")
+    except Exception:
+        return False
+
+
+def _make_provider(reader, zreader):
+    """把 WorkBuddy 与 ZCode 快照合并成一个 provider。
+
+    ZCode 仅在用户开启开关、且处于多会话模式时并入 ``sessions``：
+    WorkBuddy 会话在前，ZCode 会话在后，统一按最后活跃时间倒序，
+    由界面现有的 _render_multi 直接消费（ZCode 行标题自带前缀）。
+    """
+    def combined():
+        snap = reader.snapshot()
+        if not zreader or not _zcode_enabled():
+            return snap
+        try:
+            zs = zreader.snapshot()
+            zrows = zs.get("zcode_sessions") or []
+            wb_rows = snap.get("sessions") or []
+            merged = list(wb_rows) + list(zrows)
+            merged.sort(key=lambda r: r.get("last_active", 0), reverse=True)
+            snap["sessions"] = merged
+            snap["session_count"] = len(merged)
+            snap["zcode_count"] = zs.get("zcode_count", 0)
+            snap["zcode_error"] = zs.get("zcode_error")
+        except Exception:
+            pass                      # ZCode 合并失败不影响 WorkBuddy 主数据
+        return snap
+    return combined
+
+
 def main() -> None:
     if not _acquire_single_instance():
         sys.exit(0)
@@ -97,7 +140,17 @@ def main() -> None:
         raise
 
     reader = UsageReader(projects_dir)
-    run_app(reader.snapshot, interval_ms=1000, mode_setter=reader.set_multi)
+
+    # ZCode 数据层按需初始化：失败不影响主悬浮窗
+    zreader = None
+    try:
+        from zcode_reader import ZcodeReader
+        zreader = ZcodeReader()
+    except Exception:
+        _write_log("ZCode 数据层初始化失败（已忽略）：\n" + traceback.format_exc())
+
+    run_app(_make_provider(reader, zreader), interval_ms=1000,
+            mode_setter=reader.set_multi)
 
 
 if __name__ == "__main__":

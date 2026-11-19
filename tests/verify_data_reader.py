@@ -388,6 +388,22 @@ def case_new_big_file_history():
 
 # ---- 用例 9：停止生成后速率归零，单条样本要给出数值 ------------------------
 
+def case_speed_window_constants():
+    """速率窗口须为 5 分钟且 idle > 窗口（深度思考场景，P21）。"""
+    case = "9"
+    _record(case,
+            "速率窗口=5分钟（深度思考稀疏 token 场景，勿改回 60 秒）",
+            data_reader.SPEED_WINDOW_MS, 5 * 60 * 1000)
+    _record_true(case, "idle 阈值 > 速率窗口（窗口内有样本不误判空闲）",
+                 data_reader.SPEED_IDLE_MS > data_reader.SPEED_WINDOW_MS,
+                 "idle=%d window=%d" % (data_reader.SPEED_IDLE_MS,
+                                        data_reader.SPEED_WINDOW_MS))
+    _record_true(case, "样本保留时长 > 速率窗口",
+                 data_reader.SPEED_KEEP_MS > data_reader.SPEED_WINDOW_MS,
+                 "keep=%d window=%d" % (data_reader.SPEED_KEEP_MS,
+                                        data_reader.SPEED_WINDOW_MS))
+
+
 def case_speed_single_sample_and_idle():
     case = "9"
     root, proj = _mk_case_dir()
@@ -429,7 +445,7 @@ def case_speed_single_sample_and_idle():
         shutil.rmtree(root, ignore_errors=True)
 
 
-# ---- 用例 10：多会话模式（10 分钟活跃窗口 + 最多 3 行） -------------------
+# ---- 用例 10：多会话模式（10 分钟活跃窗口 + 数据层输出全部活跃会话） ----
 
 def case_multi_session():
     case = "10"
@@ -459,14 +475,14 @@ def case_multi_session():
                 any(row["session_id"] in ("s-old", "s-far") for row in rows),
                 False)
 
-        # 再补 3 个活跃会话，总数 5，列表最多 3 行
+        # 再补 3 个活跃会话，总数 5；数据层输出全部活跃会话供 UI 展开
         for index in range(3):
             path = os.path.join(proj, "s-extra%d.jsonl" % index)
             _append_records(path, 1)
         snap = _wait(reader, lambda s: (s.get("session_count") or 0) >= 5, 10.0)
         _record(case, "活跃总数==5", snap.get("session_count"), 5)
-        _record(case, "列表最多 3 行（多出的靠 session_count 提示）",
-                len(snap.get("sessions") or []), 3)
+        _record(case, "列表输出全部活跃会话（UI 自行决定收起/展开）",
+                len(snap.get("sessions") or []), 5)
 
         # 切回单会话：只保留最新一个
         reader.set_multi(False)
@@ -498,6 +514,7 @@ def main():
     case_history_no_duplicate()
     case_truncate_rewrite()
     case_new_big_file_history()
+    case_speed_window_constants()
     case_speed_single_sample_and_idle()
     case_multi_session()
 
