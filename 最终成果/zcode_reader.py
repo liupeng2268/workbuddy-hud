@@ -47,6 +47,10 @@ SPEED_KEEP_MS = 10 * 60 * 1000
 #: 即超过 6 分钟完全无输出才显示空闲。
 SPEED_IDLE_MS = 6 * 60 * 1000
 
+#: 速率「陈旧」阈值（毫秒）：最新样本距今超过此值，界面加 `~` 前缀淡化，
+#: 表示「上次生成的值，当前未在生成」（与 data_reader 一致，P22）
+SPEED_STALE_MS = 90 * 1000
+
 #: 最多输出的会话数（UI 收起时显示 3 个，展开时显示全部；与 data_reader 对齐）
 MAX_SESSIONS = 15
 
@@ -129,11 +133,13 @@ class _ZSession:
         window = [s for s in self.samples if s[0] >= cutoff]
         speed = None
         speed_idle = False
+        speed_stale = False
         if window:
             newest = max(s[0] for s in window)
             if now_ms - newest > SPEED_IDLE_MS:
                 speed_idle = True
             else:
+                speed_stale = (now_ms - newest) > SPEED_STALE_MS
                 out_tokens = sum(s[1] for s in window)
                 total_duration = sum(s[2] for s in window)
                 if total_duration > 0:
@@ -164,6 +170,7 @@ class _ZSession:
             "hit_rate": hit_rate,
             "speed": speed,
             "speed_idle": speed_idle,
+            "speed_stale": speed_stale,
             "total_out": self.output,
             "records": self.records,
             "hit_tokens": self.cache_read,

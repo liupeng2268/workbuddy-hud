@@ -219,6 +219,20 @@ def _fmt_speed(value):
     return "{:.1f} tok/s".format(speed)
 
 
+def _speed_text(value, stale=False, idle=False):
+    """速率显示文本。
+
+    - idle（无样本）-> "空闲"
+    - stale（历史值）-> "~38.4 tok/s"，前缀 ~ 表示当前未在生成
+    - 正常 -> "38.4 tok/s"
+    """
+    if idle and value is None:
+        return "空闲"
+    if stale and value is not None:
+        return "~" + _fmt_speed(value)
+    return _fmt_speed(value)
+
+
 def _fmt_tokens(value):
     """累计输出 token -> "22.3M" / "18.4K" / "860"，None -> "--"。"""
     total = _as_int(value)
@@ -957,11 +971,12 @@ class _FloatingWindow(object):
             )
 
         speed = snapshot.get("speed")
-        speed_text = "空闲" if (speed is None and idle) else _fmt_speed(speed)
+        stale = bool(snapshot.get("speed_stale"))
+        speed_text = _speed_text(speed, stale=stale, idle=idle)
         self.canvas.itemconfigure(
             self.item_speed,
             text=speed_text,
-            fill=FG,
+            fill=MUTED if stale else FG,   # 历史值淡化，实时值高亮
         )
         # 第三行：首次运行先显示操作引导，到时自动恢复真实指标
         if self._hint_active:
@@ -1069,10 +1084,11 @@ class _FloatingWindow(object):
                 self.font9, row.get("title") or "--", self.MULTI_TITLE_MAX
             )
             speed = row.get("speed")
-            if speed is None and bool(row.get("speed_idle")):
-                speed_text = "空闲"
-            else:
-                speed_text = _fmt_speed(speed)
+            speed_text = _speed_text(
+                speed,
+                stale=bool(row.get("speed_stale")),
+                idle=bool(row.get("speed_idle")),
+            )
             self.canvas.itemconfigure(title_item, text=title, fill=FG)
             self.canvas.itemconfigure(
                 rate_item,

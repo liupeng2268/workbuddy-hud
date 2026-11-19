@@ -425,6 +425,16 @@ def case_speed_single_sample_and_idle():
             "speed=%r" % (speed,),
         )
 
+        # 陈旧阈值压到 300ms：1 秒后样本仍在 5 分钟窗口内，但应标记 stale
+        saved_stale = _patch_const("SPEED_STALE_MS", 300)
+        time.sleep(1.2)
+        snap = reader.snapshot()
+        _record_true(case, "样本陈旧后 speed_stale 为 True（历史值待淡化）",
+                     snap.get("speed_stale") is True,
+                     "speed_stale=%r speed=%r" % (snap.get("speed_stale"),
+                                                  snap.get("speed")))
+        _restore_const("SPEED_STALE_MS", saved_stale)
+
         # 空闲阈值压到 300ms，1 秒后就必然超时
         saved_idle = _patch_const("SPEED_IDLE_MS", 300)
         time.sleep(1.2)

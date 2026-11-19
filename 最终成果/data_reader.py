@@ -69,6 +69,11 @@ SPEED_KEEP_MS = 10 * 60 * 1000
 #: 不会被误判为空闲；超过 6 分钟完全无输出才显示空闲
 SPEED_IDLE_MS = 6 * 60 * 1000
 
+#: 速率「陈旧」阈值（毫秒）：最新 token 样本距今超过这个值，说明当前未在
+#: 生成，速率只是窗口内的历史值。界面据此加 `~` 前缀淡化显示，既不误导、
+#: 又不像直接归零那样让深度思考场景空窗（findings.md P22）。
+SPEED_STALE_MS = 90 * 1000
+
 #: 首调等待时间：0 表示不等待，后台扫描期间由界面显示占位
 PRIME_WAIT = 0.0
 
@@ -206,6 +211,7 @@ class _SessionStats(object):
         window = [s for s in self.samples if s[0] >= cutoff]
         speed = None
         speed_idle = False
+        speed_stale = False
         if window:
             newest = max(s[0] for s in window)
             if now_ms - newest > SPEED_IDLE_MS:
@@ -215,6 +221,8 @@ class _SessionStats(object):
                 speed = sum(s[1] for s in window) / span
                 if speed < 0.0:
                     speed = None
+                # 最新样本已较旧 -> 速率是历史值，界面加 ~ 标记淡化
+                speed_stale = (now_ms - newest) > SPEED_STALE_MS
 
         duration = 0.0
         if self.min_ts and self.max_ts > self.min_ts:
@@ -232,6 +240,7 @@ class _SessionStats(object):
             ),
             "speed": speed,
             "speed_idle": speed_idle,
+            "speed_stale": speed_stale,
             "total_out": self.out,
             "records": self.records,
             "hit_tokens": self.hit,
@@ -790,6 +799,7 @@ class UsageReader:
             # 通用
             "speed": primary.get("speed"),
             "speed_idle": primary.get("speed_idle", False),
+            "speed_stale": primary.get("speed_stale", False),
             "files": self._file_count,
             "active_file": self._active_file,
             "updated_at": now,

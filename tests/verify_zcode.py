@@ -187,6 +187,18 @@ def main():
           row3c["speed"] is not None,
           "speed=%.1f" % row3c["speed"] if row3c["speed"] else "speed=None")
 
+    # --- 5c. 陈旧速率标记（P22）---
+    s3d = zr._ZSession("sess_stale", "陈旧", "GLM")
+    s3d.add(now_ms - 200000, 100, 5000, 100, 0,
+            done_ts=now_ms - 120000)   # 2 分钟前完成，在 5min 窗口内但陈旧
+    row3d = s3d.row(now_ms, now_ms - zr.SPEED_WINDOW_MS,
+                    now_ms - zr.SPEED_KEEP_MS)
+    check("陈旧样本 speed_stale=True（界面加 ~ 标记）",
+          row3d["speed_stale"] is True and row3d["speed"] is not None,
+          "stale=%s speed=%s" % (row3d["speed_stale"], row3d["speed"]))
+    check("新鲜样本 speed_stale=False",
+          row3b["speed_stale"] is False)
+
     # --- 6. MaxSessions 截断 ---
     many = [
         dict(sid="sess_%d" % i, title="会话%d" % i, inp=10, out=10,
