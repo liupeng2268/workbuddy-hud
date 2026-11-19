@@ -1,5 +1,31 @@
 # Progress Log —— WorkBuddy 悬浮窗
 
+## Session: 2026-11-20 00:20（停止任务仍显示速率 → v1.3.2）
+
+### Phase 12: 陈旧速率 ~ 标记
+
+- **Status:** complete（代码与打包完成，待用户手动冒烟；GitHub 提交推送未在本次做）
+- 触发：用户截图 Tailscale 会话已停却仍显示 12.6 tok/s。
+- 根因（P22）：v1.3.1 idle 6min > 5min 窗口，窗口内旧样本（264s 前）仍算速率；且 session-meta 每几秒写一次使 mtime 不可用，判断必须用最后 token 时间。
+- 修复：新增 `SPEED_STALE_MS=90s`（两个数据层同步）、`speed_stale` 字段；UI stale 速率加 `~` 前缀 + 淡化。用户选「加 ~ 标记」方案（另两选项：直接 `--`、缩短窗口）。
+- 验证：真实库 Tailscale `~29.7 tok/s`(stale）、plan-sync `20.9 tok/s`(实时）；verify_data_reader 44/44、verify_zcode 23/23、ui_pretest 57/57、编译 OK。
+- 打包：备份 v1.3.1 → `_临时\backup\*-20261120-002200.*`；v1.3.2 PE 1.3.2、SHA256 `AA1BE3D141E14A24C5B21E445BB1F903314FBEC1259099933BD72194F3A6FBD4`。
+- 待办：用户手动双击 exe 冒烟，确认停止会话显示 `~` 前缀、运行中会话正常数值。
+
+### Test Results（Phase 12）
+
+| Test | Expected | Actual | Status |
+|------|----------|--------|--------|
+| 编译检查 | 无错误 | COMPILE_OK | PASS |
+| verify_data_reader | stale 标记 | 44/44 | PASS |
+| verify_zcode | stale 标记 | 23/23 | PASS |
+| ui_pretest | ~ 前缀显示 | 57/57 | PASS |
+| 真实库验证 | 停/~、跑/数值 | ~29.7 / 20.9 tok/s | PASS |
+| PE 版本 | 1.3.2 | 1.3.2 | PASS |
+| exe 运行时冒烟 | 存活 | 未执行（WMI 被拦截） | BLOCKED |
+
+---
+
 ## Session: 2026-11-20 00:05（WorkBuddy 速率 `--` → v1.3.1）
 
 ### Phase 11: 深度思考会话速率不显示

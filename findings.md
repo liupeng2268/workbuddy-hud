@@ -77,6 +77,13 @@
 - **回归守卫**：verify_data_reader 新增用例（窗口=5min、idle>窗口、keep>窗口），40→43 项全过；全门禁绿。打包 v1.3.1（PE 1.3.1、SHA256 `88BF5A17…451E91`），备份 v1.3.0。
 - **verify_text 偶发 `0.0K`**：首次加载 `total_out=0` 时会短暂显示，后台扫描收敛后消失（连跑 3 次均 False），非本次改动引入。
 
+## 停止任务仍显示速率 → 陈旧标记（2026-11-20 00:20 → v1.3.2）
+
+- **P22 陈旧速率（已修）**：用户截图「测试 Tailscale 指定 IP 连通性」已停一会仍显示 12.6 tok/s。根因：v1.3.1 把 idle 阈值设为 6min（>5min 窗口），只要窗口内有样本就显示速率——该会话最后 token 在 264s 前（窗口内但陈旧），仍算出 9.6~12.6 tok/s。
+- **不能用 mtime 判断停止**：该会话 `session-meta` 记录每几秒写一次（mtime 1~3s 前），但那只是元数据，不代表在生成 token；真正的 usage 记录 278s 前。故判断依据必须是**最后 token 样本时间**。
+- **修法（用户选「加 ~ 标记」）**：新增 `SPEED_STALE_MS=90s`（WorkBuddy 与 ZCode 同步）。`row()` 输出 `speed_stale`（最新样本距今 >90s）；UI 渲染 stale 速率加 `~` 前缀并淡化（单会话 FG→MUTED，多会话本就 MUTED 只加前缀）。既不像直接 `--` 那样让深度思考空窗，又不误导为"正在生成"。
+- 验证：真实库 Tailscale 显示 `~29.7 tok/s`（stale=True）、plan-sync 显示 `20.9 tok/s`（stale=False）；三套测试 44/44 + 23/23 + 57/57。打包 v1.3.2（PE 1.3.2、SHA256 `AA1BE3D1…6FBD4`），备份 v1.3.1。
+
 ## Resources
 
 - `最终成果\zcode_reader.py`（ZCode db.sqlite 只读扫描，命中率 cr/input + completed_at 速率 + 5 分钟窗口）
